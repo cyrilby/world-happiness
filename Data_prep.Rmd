@@ -1,0 +1,913 @@
+---
+title: 'World happiness study: data prep for analysis'
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+    toc_depth: 3
+---
+
+```{r document_details, echo = FALSE}
+cat(" Author: Kiril Boyanov (kirilboyanov [at] gmail.com)\n", "LinkedIn: www.linkedin.com/kirilboyanov/\n", "Last update:", format(Sys.Date(), "%Y-%m-%d"))
+```
+
+The purpose of this file is to import, clean up and prepare data from multiple source for the analysis of world happiness data. Running this file is a prerequisite for being able to make some proper data visualizations and for doing statistics.
+
+<br/>
+
+# User input
+
+Specifying the local path to the folder where the analysis data are to be stored:
+
+```{r input_folder}
+AnalysisFolder <- "G:/My Drive/Projects/Data & statistics/Happiness insights/"
+```
+
+<br/>
+
+# Setting things up
+
+Importing relevant packages, defining custom functions etc.
+
+```{r library_import, message = FALSE, warning = FALSE}
+# Importing relevant packages
+
+# For general data-related tasks
+library(plyr)
+library(tidyverse)
+library(data.table)
+library(openxlsx)
+library(readxl)
+library(arrow)
+library(zoo)
+
+# For downloading econ data from the web
+library(rdbnomics)
+
+# For cleaning up in country names
+library(countrycode)
+```
+
+```{r custom_functions, echo=FALSE}
+# Importing custom functions created for this project
+source("Custom_functions.R")
+```
+
+<br/>
+
+To deal with variables that have irregular and/or too long names, we also import a manually maintained mapping table, a preview of which is printed below:
+
+```{r labels_mapping, echo=FALSE}
+# Importing labels mapping primarily used for charts
+LabelsMapping <- read_excel("Data/Variables mapping.xlsx") %>%
+  select(Variable, ProperName)
+
+# Converting df to a named list and previewing the first 5 entries
+LabelsMapping <- split(LabelsMapping$ProperName, LabelsMapping$Variable)
+LabelsMapping[1:5]
+```
+
+<br/>
+
+# Happiness data
+
+The data in here are sourced from the [World Happiness Report](https://worldhappiness.report/ed/2022/#appendices-and-data). They generally cover the period 2004-2022, though there may be some missing data for some countries.
+
+```{r happiness_data_step1, message = FALSE, warning = FALSE}
+# Importing the latest data
+HappinessLatest <- read_excel(paste(AnalysisFolder, "Data/Raw/Happiness/Happiness data for 2022.xls", sep = ""), sheet = "2022") %>%
+  mutate(Year = 2022) %>%
+  rename("HappinessScore" = "Happiness score")
+
+# Importing historical data
+HappinessHistorical <- read_excel(paste(AnalysisFolder, "Data/Raw/Happiness/Happiness data for earlier years.xls", sep = ""), sheet = "Sheet1") %>%
+  rename("Country" = "Country name", "HappinessScore" = "Life Ladder", "Year" = "year")
+
+# Appending data, reordering columns and dropping irrelevant ones
+# Data is sorted with newest and highest ranked on top
+Happiness <- plyr::rbind.fill(HappinessLatest, HappinessHistorical) %>%
+  select(Country, Year, HappinessScore) %>%
+  arrange(desc(Year), desc(HappinessScore)) %>%
+  group_by(Year) %>%
+  mutate(AnnualRank = row_number()) %>% # re-creating rank number
+  ungroup() %>%
+  filter(!is.na(HappinessScore)) # removing invalid rows
+
+rm(HappinessLatest, HappinessHistorical)
+
+# Adding ISO3-standardized country code
+Happiness <- Happiness %>%
+  mutate(CountryCode = countrycode(Country, "country.name", "iso3c")) %>%
+  select(Country, CountryCode, Year, HappinessScore)
+```
+
+A preview of the imported data is shown below:
+
+```{r happiness_data_step2}
+# Previewing the data
+head(Happiness, 5)
+```
+
+As a part of the data cleaning, we've automatically created an ISO3 standardized country code that we can use to merge the data to other sources. However, not all countries may be classified, in which case the ones without any matches will be printed out below:
+
+```{r happiness_data_step3}
+# Printing out cases with no matches
+Unmatched <- Happiness %>%
+  filter(is.na(CountryCode))
+unique(Unmatched$Country)
+```
+
+As these are fairly small countries (and not universally recognized), we decide to ignore them in our analysis.
+
+```{r happiness_data_step4}
+# Exporting the clean data
+write_parquet(Happiness, paste(AnalysisFolder, "Data/Clean/Happiness.parquet", sep = ""))
+rm(Unmatched)
+```
+
+<br/>
+
+# Overview of data types
+
+In this analysis, we will be using data that can be broadly divided into the following categories:
+
+-   **Economic data**: GDP per capita (adjusted for PPP), inequality, poverty, taxation, trade openness, inflation, unemployment, spending on e.g. education, healthcare, military, construction.
+-   **Political data**: institutional quality & stability, military conflicts, terrorism, quality of democracy and corruption
+-   **Societal data**: population, migration, urbanization, crime rates, homicides, primary, secondary and tertiary education (% of population, general and by gender), political representation of women/women's rights metrics, loneliness and social connections, suicide rates
+-   **Environmental data**: CO2 emissions, access to energy, pollution, biodiversity, land use, forests and deforestation
+-   **Healthcare data**: smoking, drug use & alcohol use, obesity, contagious diseases prevalence, infant & child mortality, cancer, metrics on mental health
+
+Unfortunately, data that falls under a single category based on our own classification above may need to be put together from several different sources.
+
+<br/>
+
+# Downloading data from The World Bank
+
+All data points that can be sourced from the World Bank's WDI and WGI datasets are downloaded in here. Following that, the data is transformed so that we have one row per country-year combination and one column for each relevant variable. Country names are standardized according to the ISO3 specification. Please note that the World bank data contains aggregate data for regions, these will be dropped in any further analysis.
+
+## Data from the World Governance Indicators (WGI) dataset
+
+These include data on institutional quality and stability.
+
+```{r world_bank_wgi_load}
+# Specifying which indicators to download
+SeriesToFetch <- c("CC.EST", "PV.EST", "RL.EST", "VA.EST", "GE.EST")
+
+# Fetching data for each indicator in the list
+WGI <- data.frame()
+for (series in SeriesToFetch) {
+  SeriesData <- rdb("WB", "WGI", query = series)
+  WGI <- rbind(WGI, SeriesData)
+}
+rm(SeriesData)
+
+# Putting the indicators in columns rather than rows
+WGI <- WGI %>%
+  select(country, indicator, original_period, value) %>%
+  distinct(country, indicator, original_period, .keep_all = TRUE) %>%
+  pivot_wider(id_cols = c(country, original_period), names_from = "indicator", values_from = "value")
+
+# Using the indicators' full names as variable names
+SeriesMetadata <- rdb_dimensions("WB", "WGI", simplify = TRUE)
+SeriesMetadata <- SeriesMetadata[3]
+SeriesMetadata <- as.data.frame(do.call(cbind, SeriesMetadata))
+names(SeriesMetadata) <- c("Indicator", "Name")
+setnames(WGI, old = SeriesMetadata$Indicator, new = SeriesMetadata$Name, skip_absent = TRUE)
+
+# Standardizing country names and adding unique ID
+WGI <- WGI %>%
+  mutate(CountryISO3 = countrycode(country, "wb", "iso3c"),
+         RowID = paste(CountryISO3, original_period, sep = "_")
+         )
+
+# Ensuring proper spelling of column names
+RenameMatchingCols(WGI, LabelsMapping)
+
+# Exporting the data
+write_parquet(WGI, paste(AnalysisFolder, "Data/Clean/WGI.parquet", sep = ""))
+
+# Previewing the downloaded data
+tail(WGI, 5)
+```
+
+## Data from the World Development Indicators (WDI) dataset
+
+These include data on topics ranging from macroeconomics and demographics to environment and health.
+
+```{r world_bank_wdi_load}
+# Specifying which indicators to download
+SeriesToFetch <- c("NY.GDP.PCAP.PP.KD", "NY.GDP.PCAP.PP.CD",
+                     "SI.POV.GINI", "SI.POV.GAPS", "SI.POV.LMIC.GP",
+                     "SI.POV.UMIC.GP", "SI.POV.DDAY", "SI.POV.LMIC",
+                     "SI.POV.UMIC", "SI.POV.MDIM", "SI.POV.MDIM.HH",
+                     "SI.POV.MDIM.XQ", "IC.TAX.LABR.CP.ZS",
+                     "IC.TAX.PRFT.CP.ZS", "GC.TAX.TOTL.GD.ZS",
+                     "GC.TAX.GSRV.RV.ZS", "GC.TAX.GSRV.VA.ZS",
+                     "IC.TAX.TOTL.CP.ZS", "NE.IMP.GNFS.ZS",
+                     "NE.EXP.GNFS.ZS", "FP.CPI.TOTL.ZG",
+                     "SL.UEM.TOTL.FE.NE.ZS", "SL.UEM.TOTL.MA.ZS",
+                     "SL.UEM.TOTL.ZS", "SL.UEM.TOTL.NE.ZS",
+                     "SL.UEM.1524.ZS", "SL.UEM.1524.NE.ZS",
+                     "SH.XPD.CHEX.GD.ZS", "SH.XPD.CHEX.PP.CD",
+                     "SE.XPD.TOTL.GD.ZS", "SE.XPD.PRIM.PC.ZS",
+                     "SE.XPD.SECO.PC.ZS", "SE.XPD.TERT.PC.ZS",
+                     "MS.MIL.XPND.GD.ZS", "GB.XPD.RSDV.GD.ZS",
+                     "SP.POP.TOTL", "SP.POP.0014.TO", "SP.POP.1564.TO",
+                     "SP.POP.65UP.TO", "SM.POP.NETM",  "SP.URB.TOTL",
+                     "SP.URB.TOTL.IN.ZS", "VC.IHR.PSRC.P5",
+                     "VC.IHR.PSRC.FE.P5", "VC.IHR.PSRC.MA.P5",
+                     "FX.OWN.TOTL.FE.ZS", "SE.SEC.UNER.LO.FE.ZS",
+                     "SL.EMP.SMGT.FE.ZS", "SL.TLF.ACTI.FE.ZS",
+                     "SL.TLF.TOTL.FE.ZS", "SE.ADT.LITR.FE.ZS",
+                     "SH.STA.SUIC.P5", "SH.STA.SUIC.FE.P5",
+                     "SH.STA.SUIC.MA.P5", "EN.ATM.CO2E.PP.GD.KD",
+                     "EN.ATM.CO2E.PP.GD", "EN.ATM.CO2E.KT",
+                     "EN.ATM.CO2E.PC", "EG.CFT.ACCS.ZS",
+                     "EG.CFT.ACCS.RU.ZS", "EG.CFT.ACCS.UR.ZS",
+                     "EG.ELC.ACCS.ZS", "EG.ELC.ACCS.RU.ZS",
+                     "EG.ELC.ACCS.UR.ZS", "EN.ATM.PM25.MC.M3",
+                     "EN.ATM.PM25.MC.ZS", "AG.LND.AGRI.ZS",
+                     "AG.LND.ARBL.ZS", "AG.CON.FERT.ZS",
+                     "AG.LND.FRST.ZS", "AG.LND.TOTL.K2", "ER.LND.PTLD.ZS",
+                     "SE.COM.DURS", "SE.PRE.DURS", "SE.PRM.DURS", "SE.SEC.DURS",
+                     "SE.TER.CUAT.BA.ZS", "SE.SEC.CUAT.LO.ZS",
+                     "SE.PRM.CUAT.ZS", "SE.SEC.CUAT.UP.ZS", "SE.TER.CUAT.MS.ZS")
+
+# Fetching data for each indicator in the list
+WDI <- data.frame()
+for (series in SeriesToFetch) {
+  SeriesData <- rdb("WB", "WDI", query = series)
+  WDI <- rbind(WDI, SeriesData)
+}
+rm(SeriesData)
+
+# Putting the indicators in columns rather than rows
+WDI <- WDI %>%
+  select(country, indicator, original_period, value) %>%
+  distinct(country, indicator, original_period, .keep_all = TRUE) %>%
+  pivot_wider(id_cols = c(country, original_period), names_from = "indicator", values_from = "value")
+
+# Using the indicators' full names as variable names
+SeriesMetadata <- rdb_dimensions("WB", "WDI", simplify = TRUE)
+SeriesMetadata <- SeriesMetadata[3]
+SeriesMetadata <- as.data.frame(do.call(cbind, SeriesMetadata))
+names(SeriesMetadata) <- c("Indicator", "Name")
+setnames(WDI, old = SeriesMetadata$Indicator, new = SeriesMetadata$Name, skip_absent = TRUE)
+
+# Standardizing country names and adding unique ID
+WDI <- WDI %>%
+  mutate(CountryISO3 = countrycode(country, "wb", "iso3c"),
+         RowID = paste(CountryISO3, original_period, sep = "_")
+         )
+
+# Ensuring proper spelling of column names
+RenameMatchingCols(WDI, LabelsMapping)
+
+# Exporting the data
+write_parquet(WDI, paste(AnalysisFolder, "Data/Clean/WDI.parquet", sep = ""))
+
+# Previewing the downloaded data
+tail(WDI, 5)
+```
+
+<br/>
+
+# Downloading data from the United Nations (UN)'s country dataset
+
+Contains data mostly related to diseases and access to medicine.
+
+```{r undata_load}
+# Specifying which indicators to download
+SeriesToFetch <- c("AG_LND_RFRST", "SH_ACC_DRUG",
+                   "ER_LND_TMPA", "SH_DYN_IMRT")
+
+# Fetching data for each indicator in the list
+UNDATA <- data.frame()
+StartTime <- Sys.time()
+for (series in SeriesToFetch) {
+  SeriesData <- rdb("UNDATA", "DF_UNDATA_COUNTRYDATA", query = series)
+  UNDATA <- rbind(UNDATA, SeriesData)
+}
+rm(SeriesData)
+
+# Putting the indicators in columns rather than rows
+UNDATA <- UNDATA %>%
+  select(REF_AREA, SERIES, original_period, value) %>%
+  distinct(REF_AREA, SERIES, original_period, .keep_all = TRUE) %>%
+  pivot_wider(id_cols = c(REF_AREA, original_period), names_from = "SERIES", values_from = "value")
+
+# Using the indicators' full names as variable names
+SeriesMetadata <- rdb_dimensions("UNDATA", "DF_UNDATA_COUNTRYDATA", simplify = TRUE)
+SeriesMetadata <- SeriesMetadata[5]
+SeriesMetadata <- as.data.frame(do.call(cbind, SeriesMetadata))
+names(SeriesMetadata) <- c("Indicator", "Name")
+setnames(UNDATA, old = SeriesMetadata$Indicator, new = SeriesMetadata$Name, skip_absent = TRUE)
+
+# Standardizing country names and adding unique ID
+UNDATA <- UNDATA %>%
+  mutate(CountryISO3 = countrycode(REF_AREA, "iso3c", "iso3c"),
+         RowID = paste(CountryISO3, original_period, sep = "_")
+         )
+
+# Ensuring proper spelling of column names
+RenameMatchingCols(UNDATA, LabelsMapping)
+
+# Exporting the data
+write_parquet(UNDATA, paste(AnalysisFolder, "Data/Clean/UNDATA.parquet", sep = ""))
+
+# Previewing the downloaded data
+tail(UNDATA, 5)
+```
+
+<br/>
+
+# Cleaning data on corruption from Transparency International (TI)
+
+The raw data comes in the following format:
+
+-   Several CSV files covering the years 2005-2011 have the same columns & formatting
+-   An XLSX file contains data covering the period 2012-2022 on a single sheet (though with a different formatting than the CSV files)
+
+In addition to this split, TI uses different scaling for the Corruption Perception Index (CPI), which ranges between 1-10 in the years prior to 2012 and between 1-100 in the years after.
+
+## Importing and cleaning CSV file from TI
+
+Even though TI advises against using both data together due to changes in their methodology, we unify the scaling and put the data together. This is because countries have relatively stable rankings before and after 2011 as shown below, meaning that the change in methodology is not that great in practical terms.
+
+```{r corruption_data_step1}
+# Importing and appending CSV files together
+FilesToLoad <- c("CPI 2005.csv", "CPI 2006.csv", "CPI 2007.csv",
+                 "CPI 2008.csv", "CPI 2009.csv", "CPI 2010.csv",
+                 "CPI 2011.csv")
+
+Corruption_CSV = data.frame()
+for (file in FilesToLoad) {
+  ImportData <- read.csv(paste(AnalysisFolder, "Data/Raw/Corruption/", file, sep = "")) %>%
+    mutate(year = substr(file, 5, 8))
+  Corruption_CSV <- rbind(Corruption_CSV, ImportData)
+}
+rm(ImportData)
+
+# Converting the pre-2012 data to use the same scaling as the post-2012 data
+suppressWarnings(Corruption_CSV$score <- as.numeric(Corruption_CSV$score))
+Corruption_CSV <- Corruption_CSV %>%
+  rename(score_2011scale = score) %>%
+  mutate(score = score_2011scale * 10)
+```
+
+## Importing and cleaning XLSX file from TI
+
+Finally, as the CPI has reversed ratings, with a higher score meaning lower corruption, we also add an inverse score where we subtract the original score from 100. This will help us get more intuitive interpretation of the conclusions later in our analysis. A preview of the cleaned up data is shown below:
+
+```{r corruption_data_step2}
+# Importing 2012-2022 data
+Corruption_XLSX <- read_excel(paste(AnalysisFolder, "Data/Raw/Corruption/CPI 2022.xlsx", sep = ""), sheet = "CPI Timeseries 2012 - 2022", skip = 2) %>%
+  rename(country = `Country / Territory`, iso = ISO3, region = Region)
+
+# We have lots of metadata columns, we only keep the ones that either
+# serve as IDs or contain the actual CPI scores
+Corruption_XLSX <- Corruption_XLSX %>%
+  select(country, iso, region, starts_with("CPI score"))
+
+# As scores are listed in separate cols for each year, we need to transpose the data
+Corruption_XLSX <- Corruption_XLSX %>%
+  pivot_longer(cols = starts_with("CPI score")) %>%
+  rename(score = value) %>%
+  mutate(year = substr(name, 11, 14),
+         year = as.numeric(year)
+         ) %>%
+  select(-name)
+
+# Appending to pre-2012 data and inverting the scaling for better interpretability
+Corruption <- plyr::rbind.fill(Corruption_CSV, Corruption_XLSX) %>%
+  mutate(score_inv = 100 - score,
+         score_2011scale_inv = 10 - score_2011scale
+         )
+rm(Corruption_CSV, Corruption_XLSX)
+
+# Standardizing country names and adding a unique ID
+Corruption <- Corruption %>%
+  mutate(CountryISO3 = countrycode(iso, "iso3c", "iso3c"),
+         RowID = paste(CountryISO3, year, sep = "_")
+         )
+
+# Ensuring proper spelling of column names
+RenameMatchingCols(Corruption, LabelsMapping)
+
+# Exporting the clean data
+write_parquet(Corruption, paste(AnalysisFolder, "Data/Clean/Corruption.parquet", sep = ""))
+
+# Previewing the data
+head(Corruption, 5)
+```
+
+<br/>
+
+# Cleaning data on democracy quality from Varieties of Democracy (V-Dem)
+
+This data requires no other modifications than only keeping some few relevant columns, standardizing country names and giving the columns some more descriptive names. A preview of the first 5 rows is shown below:
+
+```{r democracy_data}
+# Importing the data, selecting and renaming relevant columns
+Democracy <- read.csv(paste(AnalysisFolder, "Data/Raw/Democracy/V-Dem-CY-Core-v13.csv", sep = "")) %>%
+  select(country_name, country_text_id, year, v2x_polyarchy, v2x_freexp_altinf, v2x_frassoc_thick, v2x_suffr, v2xel_frefair, v2x_elecoff) %>%
+  rename(ElectoralDemocracyIndex = v2x_polyarchy,
+         FreedomOfExpression = v2x_freexp_altinf,
+         FreedomOfAssociation = v2x_frassoc_thick,
+         PopulationPctWithSuffrage = v2x_suffr,
+         CleanElectionsIndex = v2xel_frefair,
+         ElectedOfficialsIndex = v2x_elecoff)
+
+# Standardizing country names and adding a unique ID
+Democracy <- Democracy %>%
+  mutate(CountryISO3 = countrycode(country_text_id, "iso3c", "iso3c"),
+         RowID = paste(CountryISO3, year, sep = "_")
+         )
+
+# Exporting the clean data
+write_parquet(Democracy, paste(AnalysisFolder, "Data/Clean/Democracy.parquet", sep = ""))
+
+# Previewing the data
+head(Democracy, 5)
+```
+
+<br/>
+
+# Cleaning data on military conflicts from the UCDP
+
+This is mostly data related to number of deaths resulting from armed conflicts. Relevant data processing tasks in here include aggregating the data at the country level (for each year) as well as splitting the data in several rows. There are cases where a conflict listed on a single row actually refers to several countries at the same time. In such case, the number of victims will be split equally across all countries as a form of approximation.
+
+```{r conflicts_data}
+# Importing the data, keeping relevant columns only and creating a unique ID
+Conflicts <- read.csv(paste(AnalysisFolder, "Data/Raw/Conflicts/ucdp-onesided-221.csv", sep = "")) %>%
+  select(conflict_id, year, best_fatality_estimate, location) %>%
+  mutate(RowID = paste(conflict_id, year, sep = "_"))
+
+# Counting how many countries the row covers
+Conflicts <- Conflicts %>%
+  mutate(NumberOfCountries = str_count(location, ",") + 1,
+         ConflictsFatalityPerCountry = best_fatality_estimate/NumberOfCountries)
+
+# Splitting the figures at the country level
+Conflicts <- as.data.frame(lapply(Conflicts, rep, Conflicts$NumberOfCountries)) %>%
+  group_by(RowID) %>%
+  mutate(RowForGroup = row_number()) %>%
+  ungroup %>%
+  mutate(RowNumber = row_number(),
+         CountryForRow = strsplit(location, ",")
+         )
+
+# Splitting the countries requires iterating over lists within a df
+CountryValues <- c()
+for (row in Conflicts$RowNumber) {
+  CountryList <- Conflicts$CountryForRow[row]
+  CountryList <- unlist(CountryList)
+  CountryIndex <- Conflicts$RowForGroup[row]
+  CountryValue <- CountryList[CountryIndex]
+  CountryValues <- append(CountryValues, CountryValue)
+}
+Conflicts$CountryForRow <- CountryValues
+
+# Keeping relevant columns only, standardizing country names and creating a new unique ID
+Conflicts <- Conflicts %>%
+  mutate(CountryForRow = trimws(CountryForRow),
+         CountryForRow = str_replace(CountryForRow, "Yemen (North Yemen)", "Yemen"),
+         CountryISO3 = countrycode(CountryForRow, "country.name", "iso3c"),
+         RowID = paste(CountryISO3, year, sep = "_")
+         ) %>%
+  select(CountryISO3, year, ConflictsFatalityPerCountry, RowID) %>%
+  rename(Year = year)
+
+# If we have data pertaining to multiple conflicts, that will result in
+# duplicates; therefore, we aggregate the N of fatalities by RowID
+Conflicts <- Conflicts %>%
+  group_by(RowID) %>%
+  summarize(ConflictsFatalityPerCountry = sum(ConflictsFatalityPerCountry)) %>%
+  ungroup() %>%
+  distinct(RowID, .keep_all = TRUE)
+
+# Exporting the clean data
+write_parquet(Conflicts, paste(AnalysisFolder, "Data/Clean/Conflicts.parquet", sep = ""))
+
+# Previewing the data
+head(Conflicts, 5)
+```
+
+<br/>
+
+# Combining data in thematic datasets
+
+Now that all of our data has been cleaned up, it's time to put it into several thematic datasets covering the topics of macroeconomics, politics, society, environment and health. In order to ensure that we do not leave data points behind, we start out by identifying all country-year entries from the datasets we have. these will serve as the basis of our combined datasets.
+
+```{r creating_placeholder_df, warning = FALSE}
+# Datasets which we need to check
+ArraysToCheck <- c(Conflicts$RowID, Corruption$RowID,
+                   Democracy$RowID, WGI$RowID, WDI$RowID, UNDATA$RowID)
+UniqueEntries <- c()
+
+for (array_check in ArraysToCheck) {
+  UniqueForDataset <- unique(array_check)
+  UniqueEntries <- append(UniqueEntries, UniqueForDataset)
+}
+
+# Keeping only the unique combinations, putting them in a nicely formatted df
+# and removing invalid rows (related to the few countries which couldn't be auto coded
+# as well as to historical data we consider to be irrelevant for this analysis)
+UniqueEntries <- unique(UniqueEntries)
+PlaceholderDf <- as.data.frame(UniqueEntries)
+names(PlaceholderDf) <- c("RowID") 
+PlaceholderDf <- PlaceholderDf %>%
+  mutate(CountryISO3 = str_sub(RowID, 1, 3),
+         Country = countrycode(CountryISO3, "iso3c", "country.name"),
+         Year = str_sub(RowID, 5, 8),
+         Year = as.numeric(Year),
+         ) %>%
+  filter(!is.na(Country) & Year >= 1960) %>%
+  arrange(Country, Year)
+
+# Previewing the placeholder df
+head(PlaceholderDf, 5)
+```
+
+<br/>
+
+## Putting political data in a single dataset
+
+Notes on data quality:
+
+-   In here, we impute "0" for rows with missing data for `ConflictsFatalityPerCountry`.
+-   For other indicators where we have some data available, though perhaps with the occasional gap, we group the entries by year and project the latest available value for each country (using the *last observation carried forward* method).
+
+```{r preparing_political_data, warning = FALSE}
+# WGI: all vars are relevant, so we add them all to the placeholder
+WGI_Join <- WGI %>%
+  select(-country, -original_period, -CountryISO3)
+
+PoliticalData <- PlaceholderDf %>%
+  left_join(WGI_Join, by = "RowID")
+
+# Corruption: only need the CPI score
+Corruption_Join <- Corruption %>%
+  select(score, RowID) %>%
+  rename(CorruptionPerceptionIndex = score)
+
+PoliticalData <- PoliticalData %>%
+  left_join(Corruption_Join, by = "RowID")
+
+# Democracy: all vars are relevant
+Democracy_Join <- Democracy %>%
+  select(-country_name, -country_text_id, -year, -CountryISO3)
+
+PoliticalData <- PoliticalData %>%
+  left_join(Democracy_Join, by = "RowID")
+
+# Conflicts: all vars are relevant
+PoliticalData <- PoliticalData %>%
+  left_join(Conflicts, by = "RowID")
+
+# The following datasets contain no relevant data on this topic
+# UNDATA, WDI
+
+# Dealing with missing data
+RelevantCols <- names(PoliticalData)[5:ncol(PoliticalData)]
+PoliticalData <- PoliticalData %>%
+  mutate(ConflictsFatalityPerCountry = ifelse(!is.na(ConflictsFatalityPerCountry),
+                                              0,
+                                              ConflictsFatalityPerCountry)
+         ) %>%
+    group_by(CountryISO3) %>%
+    fill(any_of(RelevantCols), .direction = c("down")) %>%
+    ungroup()
+
+# Exporting the data
+write_parquet(PoliticalData, paste(AnalysisFolder, "Data/Clean/PoliticalData.parquet", sep = ""))
+
+# Printing variable names included in this dataset
+names(PoliticalData)[5:ncol(PoliticalData)]
+```
+
+<br/>
+
+## Putting societal/demographic data in a single dataset
+
+Notes on data quality:
+
+-   For all indicators in here where we have some data available, though perhaps with the occasional gap, we group the entries by year and project the latest available value for each country (using the *last observation carried forward* method).
+
+```{r preparing_social_data}
+# WDI: relevant factors manually listed below
+RelevantCols <-
+  c(
+    "TotalPopulation",
+    "PopulationAged14OrLess",
+    "PopulationAged15To64",
+    "PopulationAged65OrMore",
+    "NetMigration",
+    "UrbanPopulation",
+    "UrbanPopPctOfTotal",
+    "TotalHomicideRate",
+    "FemaleHomicideRate" ,
+    "MaleHomicideRate",
+    "FemaleBankingAccessPctOfPop",
+    "FemaleSchoolDropoutRate",
+    "FemaleManagementPctOfTotal",
+    "LaborParticipRateFemale",
+    "LaborForcePctFemale",
+    "FemaleLiteracyRate",
+    "AccessToCleanFuelsPctOfTotal",
+    "AccessToCleanFuelsPctOfRural",
+    "AccessToCleanFuelsPctOfUrban" ,
+    "AccessToElectricityPctOfTotal",
+    "AccessToElectricityPctOfRural",
+    "AccessToElectricityPctOfUrban",
+    "CompulsoryEducationYears",
+    "PreprimaryEducationYears",
+    "PrimaryEducationYears",
+    "SecondaryEducationYears",
+    "BScAttainedPopAged25OrMore",
+    "LowerSecEduPctOfTotal",
+    "PrimaryEduPopAged25OrMore",
+    "UpperSecEduPctOfTotal",
+    "MScAttainedPopAged25OrMore"
+  )
+
+# Selecting relevant data only and merging them
+WDI_Join <- WDI %>%
+  select(any_of(RelevantCols), RowID)
+
+SocietalData <- PlaceholderDf %>%
+  left_join(WDI_Join, by = "RowID")
+
+# The following datasets contain no relevant data on this topic
+# UNDATA, WGI, Corruption, Democracy
+
+# Dealing with missing data
+SocietalData <- SocietalData %>%
+    group_by(CountryISO3) %>%
+    fill(any_of(RelevantCols), .direction = c("down")) %>%
+    ungroup()
+
+# Exporting the  data
+write_parquet(SocietalData, paste(AnalysisFolder, "Data/Clean/SocietalData.parquet", sep = ""))
+
+# Printing variable names included in this dataset
+names(SocietalData)[5:ncol(SocietalData)]
+```
+
+<br/>
+
+## Putting economic data in a single dataset
+
+Notes on data quality:
+
+-   For all indicators in here where we have some data available, though perhaps with the occasional gap, we group the entries by year and project the latest available value for each country (using the *last observation carried forward* method).
+
+```{r preparing_economic_data}
+# WDI: relevant factors manually listed below
+RelevantCols <-
+  c(
+    "GDPPerCapitaConstant",
+    "GDPPerCapitaCurrent",
+    "GiniIndex",
+    "PovertyGap215PctOfPop",
+    "PovertyGap365PctOfPop",
+    "PovertyGap685PctOfPop",
+    "PovertyGap215Headcount",
+    "PovertyGap365Headcount",
+    "PovertyGap685Headcount",
+    "PovertyHeadcountPctOfPop",
+    "PovertyHeadcountPctOfAged17OrLess",
+    "ChildPovertyIndex",
+    "PovertyHeadcountPctOfHouseholds",
+    "TotalPovertyIndex",
+    "LaborTaxPctOfProfits",
+    "ProfitTaxPctOfProfits",
+    "TaxOnGoodsServicecPctOfRevenue",
+    "TaxOnGoodsServicecPctOfValAdded",
+    "TotalTaxPctOfProfits",
+    "ImportsPctOfGDP",
+    "ExportsPctOfGDP",
+    "ConsumerPriceInflation",
+    "FemaleUnemployment",
+    "MaleUnemployment",
+    "TotalUnemployment",
+    "TotalUnemploymentLocalEst",
+    "YouthUnemployment",
+    "YouthUnemploymentLocalEst",
+    "HealthExpenditurePctOfGDP",
+    "HealthExpenditurePerCapita",
+    "EducationExpenditurePctOfGDP",
+    "EduExpPerStudentPrimaryPctOfGDP",
+    "EduExpPerStudentSecondPctOfGDP",
+    "EduExpPerStudentTertiaryPctOfGDP",
+    "MilitaryExpenditurePctOfGDP",
+    "ResearchAndDevExpPctOfGDP"
+  )
+
+# Selecting relevant data only and merging them
+WDI_Join <- WDI %>%
+  select(any_of(RelevantCols), RowID)
+
+EconomicData <- PlaceholderDf %>%
+  left_join(WDI_Join, by = "RowID")
+
+# The following datasets contain no relevant data on this topic
+# UNDATA, WGI, Corruption, Democracy
+
+# Dealing with missing data
+EconomicData <- EconomicData %>%
+    group_by(CountryISO3) %>%
+    fill(any_of(RelevantCols), .direction = c("down")) %>%
+    ungroup()
+
+# Exporting the  data
+write_parquet(EconomicData, paste(AnalysisFolder, "Data/Clean/EconomicData.parquet", sep = ""))
+
+# Printing variable names included in this dataset
+names(EconomicData)[5:ncol(EconomicData)]
+```
+
+<br/>
+
+## Putting environmental data in a single dataset
+
+Notes on data quality:
+
+-   For all indicators in here where we have some data available, though perhaps with the occasional gap, we group the entries by year and project the latest available value for each country (using the *last observation carried forward* method).
+
+```{r preparing_environmental_data}
+# WDI & UNDATA: relevant factors manually listed below
+RelevantCols <-
+  c(
+    "CO2EmissionsKgPerConstantGDP",
+    "CO2EmissionsKgPerGDP",
+    "CO2EmissionsKt",
+    "CO2PerCapita",
+    "AgriculturalLandPctOfTotal",
+    "ArableLandPctOfTotal",
+    "FertilizerUseKgPerHectare",
+    "ForestAreaPctOfTotal",
+    "TotalLandArea",
+    "ProtectedLandAreasPctOfTotal",
+    "TotalProtectedAreas"
+    )
+
+# Selecting relevant data only and merging them
+WDI_Join <- WDI %>%
+  select(any_of(RelevantCols), RowID)
+
+EnvironmentalData <- PlaceholderDf %>%
+  left_join(WDI_Join, by = "RowID")
+
+# UNDATA: manually defined, though fewer cols
+UNDATA_JOIN <- UNDATA %>%
+  select(any_of(RelevantCols), RowID)
+
+EnvironmentalData <- EnvironmentalData %>%
+  left_join(UNDATA_JOIN, by = "RowID")
+
+# The following datasets contain no relevant data on this topic
+# WGI, Corruption, Democracy
+
+# Dealing with missing data
+EnvironmentalData <- EnvironmentalData %>%
+    group_by(CountryISO3) %>%
+    fill(any_of(RelevantCols), .direction = c("down")) %>%
+    ungroup()
+
+# Exporting the  data
+write_parquet(EnvironmentalData, paste(AnalysisFolder, "Data/Clean/EnvironmentalData.parquet", sep = ""))
+
+# Printing variable names included in this dataset
+names(EnvironmentalData)[5:ncol(EnvironmentalData)]
+```
+
+<br/>
+
+## Putting health-related data in a single dataset
+
+Notes on data quality:
+
+-   For all indicators in here where we have some data available, though perhaps with the occasional gap, we group the entries by year and project the latest available value for each country (using the *last observation carried forward* method).
+
+```{r preparing_health_data}
+# WDI & UNDATA: relevant factors manually listed below
+RelevantCols <-
+  c(
+    "TotalSuicideRate",
+    "FemaleSuicideRate",
+    "MaleSuicideRate",
+    "AirPollutionMeanExpPctOfPop",
+    "AirPollutionOverExpPctOfPop",
+    "AccessToEssentialDrugs",
+    "InfantMortalityRate"
+  )
+
+# Selecting relevant data only and merging them
+WDI_Join <- WDI %>%
+  select(any_of(RelevantCols), RowID)
+
+HealthRelatedData <- PlaceholderDf %>%
+  left_join(WDI_Join, by = "RowID")
+
+# UNDATA: manually defined, though fewer cols
+UNDATA_JOIN <- UNDATA %>%
+  select(any_of(RelevantCols), RowID)
+
+HealthRelatedData <- HealthRelatedData %>%
+  left_join(UNDATA_JOIN, by = "RowID")
+
+# The following datasets contain no relevant data on this topic
+# WGI, Corruption, Democracy
+
+# Dealing with missing data
+HealthRelatedData <- HealthRelatedData %>%
+    group_by(CountryISO3) %>%
+    fill(any_of(RelevantCols), .direction = c("down")) %>%
+    ungroup()
+
+# Exporting the  data
+write_parquet(HealthRelatedData, paste(AnalysisFolder, "Data/Clean/HealthRelatedData.parquet", sep = ""))
+
+# Printing variable names included in this dataset
+names(HealthRelatedData)[5:ncol(HealthRelatedData)]
+```
+
+<br/>
+
+# Combining the thematic data into one single dataset
+
+It could be useful to have all the data into a single dataset in case we want to make cross-thematic analysis further down the line. Below, we append the following datasets together and assign the following prefixes to all their variable names so that we can quickly get an idea of which topic each variable belongs to:
+
+-   Political data: `P_`
+-   Societal/demographic data: `S_`
+-   Economic data: `E_`
+-   Environmental data: `V_`
+-   Health-related data: `H_`
+
+Some details on the shape of the new dataset are printed below:
+
+```{r combining_all_data}
+# Starting with a new df
+BackgroundData <- PlaceholderDf
+
+# Preparing political data
+PoliticalData <- PoliticalData %>%
+  select(-CountryISO3, -Country, -Year)
+
+# Adding prefix describing the topic
+names(PoliticalData)[2:length(names(PoliticalData))] <- paste("P_", colnames(PoliticalData)[2:length(names(PoliticalData))], sep = "")
+
+# Adding political data
+BackgroundData <- BackgroundData %>%
+  left_join(PoliticalData, by = "RowID")
+
+# Preparing societal/demographic data
+SocietalData <- SocietalData %>%
+  select(-CountryISO3, -Country, -Year)
+
+# Adding prefix describing the topic
+names(SocietalData)[2:length(names(SocietalData))] <- paste("S_", colnames(SocietalData)[2:length(names(SocietalData))], sep = "")
+
+# Adding societal/demographic data
+BackgroundData <- BackgroundData %>%
+  left_join(SocietalData, by = "RowID")
+
+# Preparing economic data
+EconomicData <- EconomicData %>%
+  select(-CountryISO3, -Country, -Year)
+
+# Adding prefix describing the topic
+names(EconomicData)[2:length(names(EconomicData))] <- paste("E_", colnames(EconomicData)[2:length(names(EconomicData))], sep = "")
+
+# Adding economic data
+BackgroundData <- BackgroundData %>%
+  left_join(EconomicData, by = "RowID")
+
+# Preparing environmental data
+EnvironmentalData <- EnvironmentalData %>%
+  select(-CountryISO3, -Country, -Year)
+
+# Adding prefix describing the topic
+names(EnvironmentalData)[2:length(names(EnvironmentalData))] <- paste("V_", colnames(EnvironmentalData)[2:length(names(EnvironmentalData))], sep = "")
+
+# Adding environmental data
+BackgroundData <- BackgroundData %>%
+  left_join(EnvironmentalData, by = "RowID")
+
+# Preparing health-related data
+HealthRelatedData <- HealthRelatedData %>%
+  select(-CountryISO3, -Country, -Year)
+
+# Adding prefix describing the topic
+names(HealthRelatedData)[2:length(names(HealthRelatedData))] <- paste("H_", colnames(HealthRelatedData)[2:length(names(HealthRelatedData))], sep = "")
+
+# Adding health-related data
+BackgroundData <- BackgroundData %>%
+  left_join(HealthRelatedData, by = "RowID")
+
+# Exporting the data
+write_parquet(BackgroundData, paste(AnalysisFolder, "Data/Clean/BackgroundData.parquet", sep = ""))
+```
+
+With this, the general-purpose data prep is complete. The combined dataset has a total of `r dim(BackgroundData)[1]` rows and `r dim(BackgroundData)[2]` columns.

@@ -1,0 +1,1224 @@
+---
+title: "World happiness study: ridge regression models"
+author: "Kiril Boyanov"
+date: "`r Sys.Date()`"
+output:
+  html_document: 
+    toc: yes
+    df_print: paged
+    toc_depth: 3
+---
+
+```{r document_details, echo = FALSE}
+cat(" Author: Kiril Boyanov (kirilboyanov [at] gmail.com)\n", "LinkedIn: www.linkedin.com/kirilboyanov/\n", "Last update:", format(Sys.Date(), "%Y-%m-%d"))
+```
+
+<br>
+
+In this file, we import the already clean data (where we've also made imputations for missing values) as well as our dimensions-reduced data (from the PCA). Then, we build models to explain what drives world happiness levels.
+
+<br>
+
+# Setting things up
+
+Importing relevant packages, defining custom functions, specifying local folders etc.
+
+```{r input_folder, echo = FALSE}
+# User input: specifying the local path to the folder
+# where the analysis data are to be stored
+AnalysisFolder <- "G:/My Drive/Projects/Data & statistics/Happiness insights/"
+```
+
+```{r library_import, message = FALSE, warning = FALSE}
+# Importing relevant packages
+
+# For general data-related tasks
+library(plyr)
+library(tidyverse)
+library(data.table)
+library(openxlsx)
+library(readxl)
+library(arrow)
+library(zoo)
+
+# For working with countries
+library(countrycode)
+
+# For statistical analysis
+library(corrr)
+library(stats)
+library(factoextra)
+library(glmnet)
+library(modelr)
+
+# For data visualization
+library(plotly)
+library(ggplot2)
+```
+
+```{r custom_functions, echo=FALSE}
+# Importing custom functions created for this project
+source("Custom_functions.R")
+```
+
+<br>
+
+# Importing data
+
+We import data that was already pre-processed in the `Data_prep.Rmd` notebook and that was subjected to missing data imputation in the `Dealing_with_missing_data.Rmd` notebook. Please note that as we have two different measures of GDP included in the data, we're dropping the one that is based on current prices so as not to overestimate the importance of GDP. A preview of the data imported is shown below:
+
+```{r data_import_general, echo = FALSE}
+# Importing labels mapping primarily used for charts
+LabelsMapping_PC <- read_excel("Data/Variables mapping.xlsx") %>%
+  select(Variable, Label)
+LabelsMapping_Var <- read_excel("Data/Variables mapping.xlsx") %>%
+  select(ProperName, Label) %>%
+  rename(Variable=ProperName)
+
+# Importing the data that's ready for use
+DataForAnalysis <- read_parquet(paste(AnalysisFolder, "Data/Clean/DataForAnalysisImputed.parquet", sep = ""))
+
+# Removing GDP in current prices
+DataForAnalysis <- DataForAnalysis %>%
+  select(-E_GDPPerCapitaCurrent)
+
+# Previewing the data
+head(DataForAnalysis, 5)
+```
+
+<br>
+
+The variable labels also contain some **information about the** **scaling** of these variables, which will be important for interpretation of the models tested below. Specifically, items changing on a scale different than 0-1 will be interpreted 1:1 (e.g. if Var X increased by 1, then Happiness will increase by Y), while percentage variables will be interpreted for a change by 10 p.p. The complete scaling and interpretation are shown below:
+
+```{r data_import_scaling}
+# Importing table used for defining scaling and supporting interpretation
+LabelsMapping_Scale <- read_excel("Data/Variables mapping.xlsx") %>%
+  select(ProperName, Label, Scale) %>%
+  rename(Variable=ProperName) %>%
+  select(Variable, Scale)
+
+# Defining how to interpret coefficients with different scales
+InterpretationUnits <-
+  list(
+    "Scale between 1 and 10" = 1,
+    "Scale between -2.5 and 2.5" = 0.25,
+    "Ranked order" = 1,
+    "Scale between 0 and 100" = 10,
+    "Scale between 0 and 1" = 0.1,
+    "Absolute value (large number)" = 1000,
+    "Absolute value (small number)" = 1,
+    "Percent" = 10,
+    "Rate per 100,000" = 1,
+    "Irrelevant" = 1
+  )
+
+# Defining how to interpret coefficients with different scales
+InterpretationDescriptions <-
+  list(
+    "Scale between 1 and 10" = "Change in Y for 1 unit change in X",
+    "Scale between -2.5 and 2.5" = "Change in Y for .25 units change in X",
+    "Ranked order" = "Change in Y for 1 unit change in X",
+    "Scale between 0 and 100" = "Change in Y for 10 p.p. change in X",
+    "Scale between 0 and 1" = "Change in Y for 10 p.p. change in X",
+    "Absolute value (large number)" = "Change in Y for 1,000 units change in X",
+    "Absolute value (small number)" = "Change in Y for 1 unit change in X",
+    "Percent" = "Change in Y for 10 p.p. change in X",
+    "Rate per 100,000" = "Change in Y for 1 unit change in X",
+    "Irrelevant" = "Change in Y for 1 unit change in X"
+  )
+
+# Adding the definition to the mapping table
+LabelsMapping_Scale$ScaleFactor <- unlist(InterpretationUnits[LabelsMapping_Scale$Scale])
+LabelsMapping_Scale$ScaleDescription <- unlist(InterpretationDescriptions[LabelsMapping_Scale$Scale])
+
+# Re-ordering variables and previewing
+LabelsMapping_Scale <- LabelsMapping_Scale %>%
+  select(Variable, ScaleFactor, ScaleDescription, Scale)
+LabelsMapping_Scale
+```
+
+<br>
+
+We also import data from our PC, where the complexity of the data is reduced:
+
+```{r data_import_pca, echo = FALSE}
+# Importing the data containing the reduced number of dimensions
+EconomicData_Comp <- read_parquet(paste(AnalysisFolder, "Data/Output/EconomicData_Comp.parquet", sep = ""))
+PoliticalData_Comp <- read_parquet(paste(AnalysisFolder, "Data/Output/PoliticalData_Comp.parquet", sep = ""))
+SocialData_Comp <- read_parquet(paste(AnalysisFolder, "Data/Output/SocialData_Comp.parquet", sep = ""))
+EnvironData_Comp <- read_parquet(paste(AnalysisFolder, "Data/Output/EnvironData_Comp.parquet", sep = ""))
+HealthData_Comp <- read_parquet(paste(AnalysisFolder, "Data/Output/HealthData_Comp.parquet", sep = ""))
+
+# Combining the data in a single df
+PC_DataForAnalysis <- EconomicData_Comp %>%
+  left_join(PoliticalData_Comp, by = "RowID") %>%
+  left_join(SocialData_Comp, by = "RowID") %>%
+  left_join(EnvironData_Comp, by = "RowID") %>%
+  left_join(HealthData_Comp, by = "RowID")
+
+# Previewing the data
+head(PC_DataForAnalysis, 5)
+```
+
+<br>
+
+# Analysis with principal components
+
+In this section, we use the principal components to try and explain what drives happiness levels around the world. We do this by examining individual areas first, after which point we examine the impact of all areas at the same time.
+
+Please note that as we are working with principal components rather than actual variables, **interpretation** of the results becomes trickier. Therefore, in this section, we focus mainly on interpreting the direction of the effects (positive or negative) and on how much the different components impact `HappinessScore` relative to each other rather than measuring their actual effects (this will be done in the next section).
+
+```{r data_merge, echo = FALSE}
+# Adding happiness score to the PCA data
+HappinessScore <- DataForAnalysis %>%
+  select(RowID, HappinessScore) %>%
+  distinct(RowID, .keep_all = TRUE)
+PC_DataForAnalysis <- PC_DataForAnalysis %>%
+  left_join(HappinessScore, by = "RowID")
+```
+
+<br>
+
+## The relationship between economics and happiness
+
+Below, we fit a ridge regression model trying to explain `HappinessScore` by the principal components related to economics. A summary of the model's **fit metrics** is shown below:
+
+```{r ridge_pca_economics_fit, echo=FALSE}
+# Defining lambda values to use when testing models
+LambdasToTry <- seq(0, 1, 0.05)
+
+# Defining X and Y variables
+Y <- "HappinessScore"
+X <- c(
+      "LackOfPoverty",
+      "LackOfUnemployment",
+      "TradeAndGDP",
+      "PublicHealthExpenditure",
+      "Taxation"
+    )
+
+# Fitting a model and generating predictions
+Model <- FitRidgeModel(PC_DataForAnalysis, Y, X, LambdasToTry)
+Predictions <- predict(Model, data.matrix(PC_DataForAnalysis[, X]))
+```
+
+```{r ridge_pca_economics_metrics, echo=FALSE}
+# Getting model fit metrics
+FitMetrics <- FitMetrics_Continuous(PC_DataForAnalysis[[Y]],
+                      Predictions,
+                      Model$nobs,
+                      length(X),
+                      2)
+FitMetrics
+```
+
+<br>
+
+The impact of the various factors as shown by their **coefficients** is presented below, with the most impactful factors sorted on top:
+
+<br>
+
+```{r ridge_pca_economics_plot, echo=FALSE}
+# Plotting the top (up to) 10 coefficients
+PlotTitle <- "Economic factors and their impact on global happiness"
+PlotModelCoefPlotly(Model, 10, PlotTitle, LabelsMapping_PC, FALSE)
+```
+
+<br>
+
+## The relationship between politics and happiness
+
+Below, we fit a ridge regression model trying to explain `HappinessScore` by the principal components related to politics A summary of the model's **fit metrics** is shown below:
+
+<br>
+
+```{r ridge_pca_politics_fit, echo=FALSE}
+# Defining lambda values to use when testing models
+LambdasToTry <- seq(0, 1, 0.05)
+
+# Defining X and Y variables
+Y <- "HappinessScore"
+X <- c("ElectionsAndAccountability", "LackOfPoliticalFreedom")
+
+# Fitting a model and generating predictions
+Model <- FitRidgeModel(PC_DataForAnalysis, Y, X, LambdasToTry)
+Predictions <- predict(Model, data.matrix(PC_DataForAnalysis[, X]))
+```
+
+```{r ridge_pca_politics_metrics, echo=FALSE}
+# Getting model fit metrics
+FitMetrics <- FitMetrics_Continuous(PC_DataForAnalysis[[Y]],
+                      Predictions,
+                      Model$nobs,
+                      length(X),
+                      2)
+FitMetrics
+```
+
+<br>
+
+The impact of the various factors as shown by their **coefficients** is presented below, with the most impactful factors sorted on top:
+
+<br>
+
+```{r ridge_pca_politics_plot, echo=FALSE}
+# Plotting the top (up to) 10 coefficients
+PlotTitle <- "Political factors and their impact on global happiness"
+PlotModelCoefPlotly(Model, 10, PlotTitle, LabelsMapping_PC, FALSE)
+```
+
+<br>
+
+## The relationship between social factors and happiness
+
+Below, we fit a ridge regression model trying to explain `HappinessScore` by the principal components related to society. A summary of the model's **fit metrics** is shown below:
+
+```{r ridge_pca_social_fit, echo=FALSE}
+# Defining lambda values to use when testing models
+LambdasToTry <- seq(0, 1, 0.05)
+
+# Defining X and Y variables
+Y <- "HappinessScore"
+X <-
+  c(
+    "LackOfAccessToEnergy",
+    "PopulationSize",
+    "WomenInLaborForce",
+    "SecondaryEducation"
+  )
+
+# Fitting a model and generating predictions
+Model <- FitRidgeModel(PC_DataForAnalysis, Y, X, LambdasToTry)
+Predictions <- predict(Model, data.matrix(PC_DataForAnalysis[, X]))
+```
+
+```{r ridge_pca_social_metrics, echo=FALSE}
+# Getting model fit metrics
+FitMetrics <- FitMetrics_Continuous(PC_DataForAnalysis[[Y]],
+                      Predictions,
+                      Model$nobs,
+                      length(X),
+                      2)
+FitMetrics
+```
+
+<br>
+
+The impact of the various factors as shown by their **coefficients** is presented below, with the most impactful factors sorted on top:
+
+<br>
+
+```{r ridge_pca_social_plot, echo=FALSE}
+# Plotting the top (up to) 10 coefficients
+PlotTitle <- "Social factors and their impact on global happiness"
+PlotModelCoefPlotly(Model, 10, PlotTitle, LabelsMapping_PC, FALSE)
+```
+
+<br>
+
+## The relationship between the environment and happiness
+
+Below, we fit a ridge regression model trying to explain `HappinessScore` by the principal components related to the environment. A summary of the model's **fit metrics** is shown below:
+
+```{r ridge_pca_environ_fit, echo=FALSE}
+# Defining lambda values to use when testing models
+LambdasToTry <- seq(0, 1, 0.05)
+
+# Defining X and Y variables
+Y <- "HappinessScore"
+X <-
+  c(
+    "CO2Emissions",
+    "AgriculturalLand",
+    "SmallCountry",
+    "LowerFertilizerUse",
+    "LandUseBalance",
+    "CO2PerCapita"
+  )
+
+# Fitting a model and generating predictions
+Model <- FitRidgeModel(PC_DataForAnalysis, Y, X, LambdasToTry)
+Predictions <- predict(Model, data.matrix(PC_DataForAnalysis[, X]))
+```
+
+```{r ridge_pca_environ_metrics, echo=FALSE}
+# Getting model fit metrics
+FitMetrics <- FitMetrics_Continuous(PC_DataForAnalysis[[Y]],
+                      Predictions,
+                      Model$nobs,
+                      length(X),
+                      2)
+FitMetrics
+```
+
+<br>
+
+The impact of the various factors as shown by their **coefficients** is presented below, with the most impactful factors sorted on top:
+
+<br>
+
+```{r ridge_pca_environ_plot, echo=FALSE}
+# Plotting the top (up to) 10 coefficients
+PlotTitle <- "Environmental factors and their impact on global happiness"
+PlotModelCoefPlotly(Model, 10, PlotTitle, LabelsMapping_PC, FALSE)
+```
+
+<br>
+
+## The relationship between health and happiness
+
+Below, we fit a ridge regression model trying to explain `HappinessScore` by the principal components related to public health. A summary of the model's **fit metrics** is shown below:
+
+```{r ridge_pca_health_fit, echo=FALSE}
+# Defining lambda values to use when testing models
+LambdasToTry <- seq(0, 1, 0.05)
+
+# Defining X and Y variables
+Y <- "HappinessScore"
+X <- c("SuicideRate", "ExposureToAirPollution")
+
+# Fitting a model and generating predictions
+Model <- FitRidgeModel(PC_DataForAnalysis, Y, X, LambdasToTry)
+Predictions <- predict(Model, data.matrix(PC_DataForAnalysis[, X]))
+```
+
+```{r ridge_pca_health_metrics, echo=FALSE}
+# Getting model fit metrics
+FitMetrics <- FitMetrics_Continuous(PC_DataForAnalysis[[Y]],
+                      Predictions,
+                      Model$nobs,
+                      length(X),
+                      2)
+FitMetrics
+```
+
+<br>
+
+The impact of the various factors as shown by their **coefficients** is presented below, with the most impactful factors sorted on top:
+
+<br>
+
+```{r ridge_pca_health_plot, echo=FALSE}
+# Plotting the top (up to) 10 coefficients
+PlotTitle <- "Health-related factors and their impact on global happiness"
+PlotModelCoefPlotly(Model, 10, PlotTitle, LabelsMapping_PC, FALSE)
+```
+
+<br>
+
+## Combined model of world happiness
+
+Below, we fit a combined ridge regression model trying to explain `HappinessScore` by all the factors at the same time. That way, we're able to simultaneously compare the importance of e.g. both economical and societal factors. A summary of the model's **fit metrics** is shown below:
+
+```{r ridge_pca_all_fit, echo=FALSE}
+# Defining lambda values to use when testing models
+LambdasToTry <- seq(0, 1, 0.05)
+
+# Defining X and Y variables
+Y <- "HappinessScore"
+X <- c(
+  "LackOfPoverty",
+  "LackOfUnemployment",
+  "TradeAndGDP",
+  "PublicHealthExpenditure",
+  "Taxation",
+  "ElectionsAndAccountability",
+  "LackOfPoliticalFreedom",
+  "LackOfAccessToEnergy",
+  "PopulationSize",
+  "WomenInLaborForce",
+  "SecondaryEducation",
+  "CO2Emissions",
+  "AgriculturalLand",
+  "SmallCountry",
+  "LowerFertilizerUse",
+  "LandUseBalance",
+  "CO2PerCapita",
+  "SuicideRate",
+  "ExposureToAirPollution"
+)
+
+# Fitting a model and generating predictions
+Model <- FitRidgeModel(PC_DataForAnalysis, Y, X, LambdasToTry)
+Predictions <- predict(Model, data.matrix(PC_DataForAnalysis[, X]))
+```
+
+```{r ridge_pca_all_metrics, echo=FALSE}
+# Getting model fit metrics
+FitMetrics <- FitMetrics_Continuous(PC_DataForAnalysis[[Y]],
+                      Predictions,
+                      Model$nobs,
+                      length(X),
+                      2)
+FitMetrics
+```
+
+<br>
+
+The impact of the various factors as shown by their **coefficients** is presented below, with the most impactful factors sorted on top:
+
+<br>
+
+```{r ridge_pca_all_plot, echo=FALSE}
+# Plotting all 10 coefficients
+PlotTitle <- "All principal components and their impact on global happiness"
+PlotModelCoefPlotly(Model, length(X), PlotTitle, LabelsMapping_PC, FALSE)
+```
+
+<br>
+
+As we can see, the impact of some factors has changed direction and/or magnitude when compared to the previous models, where we only looked at a single category (e.g. political factors) at a time. This is because there is likely at least some **multicollinearity** in the data, which our ridge regression model accounts for and corrects. Thus, the fullest and "truest" magnitudes are the ones presented here, as multicollinearity has been checked and corrected across different categories of variables.
+
+<br>
+
+# Analysis with individual variables
+
+In this section, we dive deeper into studying the impact of individual variables. This introduces more complexity in our models but allows for a **better interpretation** of the results. Specifically, instead of only being able to compare the magnitude of the impact of the variables (and its direction), we'll be able to also make conclusions about what an impact on happiness a hypothetical 1 billion USD increase in GDP would have.
+
+Please note that before we can proceed with the analysis, we need to **standardize** all potential independent variables as this is a requirement for ridge regression. We did not need to do that explicitly in the previous section as we were working with principal components in there, where standardization is already incorporated in the PCs.
+
+```{r var_standardization, echo=FALSE}
+# Getting a list of all potential independent variables
+VarsEconomy <- grep("^E_", names(DataForAnalysis), value = TRUE)
+VarsPolitics <- grep("^P_", names(DataForAnalysis), value = TRUE)
+VarsSociety <- grep("^S_", names(DataForAnalysis), value = TRUE)
+VarsEnvironment <- grep("^V_", names(DataForAnalysis), value = TRUE)
+VarsHealth <- grep("^H_", names(DataForAnalysis), value = TRUE)
+Possible_X_Vars <- unlist(list(VarsEconomy, VarsPolitics, VarsSociety, VarsEnvironment, VarsHealth))
+
+# Standardizing all potential independent variables
+ST_DataForAnalysis <- DataForAnalysis %>%
+  mutate(across(all_of(Possible_X_Vars), ~ scale(.)))
+print(sprintf("Note: Standardized %i potential X variables.", length(Possible_X_Vars)))
+```
+
+<br>
+
+## The relationship between economics and happiness
+
+### Model with all economic factors
+
+Below, we fit a ridge regression model trying to explain `HappinessScore` by the individual variables related to economics. A summary of the model's **fit metrics** is shown below:
+
+<br>
+
+```{r ridge_var_economics_all_fit, echo=FALSE}
+# Defining lambda values to use when testing models
+LambdasToTry <- seq(0, 1, 0.05)
+
+# Defining X and Y variables
+Y <- "HappinessScore"
+X <- VarsEconomy
+
+# Fitting a model and generating predictions
+Model <- FitRidgeModel(ST_DataForAnalysis, Y, X, LambdasToTry)
+Predictions <- predict(Model, data.matrix(ST_DataForAnalysis[, X]))
+```
+
+```{r ridge_var_economics_all_metrics, echo=FALSE}
+# Getting model fit metrics
+FitMetrics <- FitMetrics_Continuous(ST_DataForAnalysis[[Y]],
+                      Predictions,
+                      Model$nobs,
+                      length(X),
+                      2)
+FitMetrics
+```
+
+<br>
+
+The impact of the various factors as shown by their **coefficients** is presented below, with the most impactful factors sorted on top:
+
+<br>
+
+```{r ridge_var_economics_all_plot, echo=FALSE}
+# Plotting the top (up to) 15 coefficients
+PlotTitle <- "Economic factors and their impact on global happiness"
+PlotModelCoefPlotly(Model, 15, PlotTitle, LabelsMapping_Var, TRUE)
+```
+
+<br>
+
+From the chart above, we can see that factors such as unemployment and number/share of the population leaving below certain poverty lines (e.g. 3.65 and 2.15 USD a day) have a pronounced negative effect on happiness, while other factors such as GDP per capita have a positive effect. The coefficients of some of the factors are, however, in the opposite direction to what was expected, which can be assumed to be due to multicollinearity.
+
+### Model with select economic variables
+
+In order for us to get an easier to interpret picture of what impacts `HappinessScore` without the added confusion of having multiple variables representing the same concept (e.g. poverty), we fit a model that contains a manually **curated list of predictors**. Those are selected based on the strength of their correlation with happiness so that we only keep the variable with the highest correlation.
+
+<br>
+
+```{r economics_var_correlations, echo=FALSE}
+# Getting the correlations of HappinessScore
+Correlations <- ST_DataForAnalysis %>%
+  select(HappinessScore, starts_with("E_")) %>%
+  correlate(method = "pearson", quiet = TRUE) %>%
+  mutate(across(everything(), ~replace_na(.x, 1))) %>%
+  focus(HappinessScore) %>%
+  mutate(HappinessScore = abs(HappinessScore)) %>%
+  arrange(desc(HappinessScore))
+
+# Exporting for the sake of documentation
+write_csv(Correlations, "Data/Correlations/Happiness and economics.csv")
+
+# Deciding which variables to keep
+VarsToKeep <- c(
+  "E_GDPPerCapitaConstant",
+  "E_PovertyGap685Headcount",
+  "E_HealthExpenditurePerCapita",
+  "E_ExportsPctOfGDP",
+  "E_GiniIndex",
+  "E_EducationExpenditurePctOfGDP",
+  "E_LaborTaxPctOfProfits",
+  "E_ConsumerPriceInflation",
+  "E_FemaleUnemployment",
+  "E_ImportsPctOfGDP"
+)
+
+# Defining lambda values to use when testing models
+LambdasToTry <- seq(0, 1, 0.05)
+
+# Defining X and Y variables
+Y <- "HappinessScore"
+X <- VarsToKeep
+
+# Fitting a model and generating predictions
+Model <- FitRidgeModel(ST_DataForAnalysis, Y, X, LambdasToTry)
+Predictions <- predict(Model, data.matrix(ST_DataForAnalysis[, X]))
+```
+
+```{r ridge_var_economics_rev_metrics, echo=FALSE}
+# Getting model fit metrics
+FitMetrics <- FitMetrics_Continuous(ST_DataForAnalysis[[Y]],
+                      Predictions,
+                      Model$nobs,
+                      length(X),
+                      2)
+FitMetrics
+```
+
+<br>
+
+The impact of the various factors as shown by their **coefficients** is presented below, with the most impactful factors sorted on top:
+
+<br>
+
+```{r ridge_var_economics_rev_plot, echo=FALSE}
+# Plotting the top (up to) 15 coefficients
+PlotTitle <- "Economic factors and their impact on global happiness"
+PlotModelCoefPlotly(Model, 15, PlotTitle, LabelsMapping_Var, TRUE)
+```
+
+<br>
+
+[In this revised version of the model, the relationships become easier to interpret:]{.underline}
+
+-   We now see that poverty, inflation, female unemployment and (curiously) trade all have a **negative impact** on `HappinessScore`.
+
+-   At the same time, factors such as GDP per capita, health expenditure per capita and (curiously) inequality have a **positive impact** on happiness.
+
+The exact magnitude of the effects is shown below:
+
+<br>
+
+```{r ridge_var_economics_rev_explain, echo=FALSE, warning=FALSE}
+# Getting the actual effect sizes
+EffectSizes <- GetRealEffectSize(Model, DataForAnalysis, LabelsMapping_Scale, LabelsMapping_Var)
+EffectSizes
+```
+
+<br>
+
+Thus, we can see that if e.g. the share of the population leaving below the 6.85 USD poverty line decreased by 10 p.p., `HappinessScore` would increase by `r abs(round(EffectSizes$EffectSize[EffectSizes$Variable == "Poverty gap at 6.85 USD (% headcount)"], 2))` points. Similarly, if government spending on education as % of GDP increased by 10 p.p., happiness would increase by `r abs(round(EffectSizes$EffectSize[EffectSizes$Variable == "Educaton expenditure, % of GDP"], 2))` points. A reduction in female unemployment by 10 p.p. would also lead to an increase in happiness of about `r abs(round(EffectSizes$EffectSize[EffectSizes$Variable == "Female unemployment"], 2))` points. For comparison purposes, increasing GDP per capita by 1,000 USD would only increase happiness by `r abs(round(EffectSizes$EffectSize[EffectSizes$Variable == "GDP per capita (constant 2017 USD)"], 2))` points.
+
+<br>
+
+## The relationship between politics and happiness
+
+### Model with all political factors
+
+Below, we fit a ridge regression model trying to explain `HappinessScore` by the individual variables related to politics. A summary of the model's **fit metrics** is shown below:
+
+<br>
+
+```{r ridge_var_politics_all_fit, echo=FALSE}
+# Defining lambda values to use when testing models
+LambdasToTry <- seq(0, 1, 0.05)
+
+# Defining X and Y variables
+Y <- "HappinessScore"
+X <- VarsPolitics
+
+# Fitting a model and generating predictions
+Model <- FitRidgeModel(ST_DataForAnalysis, Y, X, LambdasToTry)
+Predictions <- predict(Model, data.matrix(ST_DataForAnalysis[, X]))
+```
+
+```{r ridge_var_politics_all_metrics, echo=FALSE}
+# Getting model fit metrics
+FitMetrics <- FitMetrics_Continuous(ST_DataForAnalysis[[Y]],
+                      Predictions,
+                      Model$nobs,
+                      length(X),
+                      2)
+FitMetrics
+```
+
+<br>
+
+The impact of the various factors as shown by their **coefficients** is presented below, with the most impactful factors sorted on top:
+
+<br>
+
+```{r ridge_var_politics_all_plot, echo=FALSE}
+# Plotting the top (up to) 15 coefficients
+PlotTitle <- "Political factors and their impact on global happiness"
+PlotModelCoefPlotly(Model, 15, PlotTitle, LabelsMapping_Var, TRUE)
+```
+
+<br>
+
+From the chart above, we can see that factors such as government effectiveness and having more voice and accountability have a positive effect on happiness, while factors such as rule of law and clean elections seem to (curiously) have a negative impact. The opposite direction to what was expected could be assumed to be due to multicollinearity.
+
+### Model with select political variables
+
+In order for us to get an easier to interpret picture of what impacts `HappinessScore` without the added confusion of having multiple variables representing the same concept (e.g. elections), we fit a model that contains a manually **curated list of predictors**. Those are selected based on the strength of their correlation with happiness so that we only keep the variable with the highest correlation.
+
+<br>
+
+```{r politics_var_correlations, echo=FALSE}
+# Getting the correlations of HappinessScore
+Correlations <- ST_DataForAnalysis %>%
+  select(HappinessScore, starts_with("P_")) %>%
+  correlate(method = "pearson", quiet = TRUE) %>%
+  mutate(across(everything(), ~replace_na(.x, 1))) %>%
+  focus(HappinessScore) %>%
+  mutate(HappinessScore = abs(HappinessScore)) %>%
+  arrange(desc(HappinessScore))
+
+# Exporting for the sake of documentation
+write_csv(Correlations, "Data/Correlations/Happiness and politics.csv")
+
+# Deciding which variables to keep
+VarsToKeep <- c(
+  "P_GovernmentEffectiveness",
+  "P_ControlOfCorruption",
+  "P_RuleOfLaw",
+  "P_CleanElectionsIndex"
+)
+
+# Defining lambda values to use when testing models
+LambdasToTry <- seq(0, 1, 0.05)
+
+# Defining X and Y variables
+Y <- "HappinessScore"
+X <- VarsToKeep
+
+# Fitting a model and generating predictions
+Model <- FitRidgeModel(ST_DataForAnalysis, Y, X, LambdasToTry)
+Predictions <- predict(Model, data.matrix(ST_DataForAnalysis[, X]))
+```
+
+```{r ridge_var_politics_rev_metrics, echo=FALSE}
+# Getting model fit metrics
+FitMetrics <- FitMetrics_Continuous(ST_DataForAnalysis[[Y]],
+                      Predictions,
+                      Model$nobs,
+                      length(X),
+                      2)
+FitMetrics
+```
+
+<br>
+
+The impact of the various factors as shown by their **coefficients** is presented below, with the most impactful factors sorted on top:
+
+<br>
+
+```{r ridge_var_politics_rev_plot, echo=FALSE}
+# Plotting the top (up to) 15 coefficients
+PlotTitle <- "Political factors and their impact on global happiness"
+PlotModelCoefPlotly(Model, 15, PlotTitle, LabelsMapping_Var, TRUE)
+```
+
+<br>
+
+The exact magnitude of the effects of these political factors is shown below:
+
+<br>
+
+```{r ridge_var_politics_rev_explain, echo=FALSE, warning=FALSE}
+# Getting the actual effect sizes
+EffectSizes <- GetRealEffectSize(Model, DataForAnalysis, LabelsMapping_Scale, LabelsMapping_Var)
+EffectSizes
+```
+
+<br>
+
+## The relationship between social factors and happiness
+
+### Model with all social factors
+
+Below, we fit a ridge regression model trying to explain `HappinessScore` by the individual variables related to society and its level of development. A summary of the model's **fit metrics** is shown below:
+
+<br>
+
+```{r ridge_var_social_all_fit, echo=FALSE}
+# Defining lambda values to use when testing models
+LambdasToTry <- seq(0, 1, 0.05)
+
+# Defining X and Y variables
+Y <- "HappinessScore"
+X <- VarsSociety
+
+# Fitting a model and generating predictions
+Model <- FitRidgeModel(ST_DataForAnalysis, Y, X, LambdasToTry)
+Predictions <- predict(Model, data.matrix(ST_DataForAnalysis[, X]))
+```
+
+```{r ridge_var_social_all_metrics, echo=FALSE}
+# Getting model fit metrics
+FitMetrics <- FitMetrics_Continuous(ST_DataForAnalysis[[Y]],
+                      Predictions,
+                      Model$nobs,
+                      length(X),
+                      2)
+FitMetrics
+```
+
+<br>
+
+The impact of the various factors as shown by their **coefficients** is presented below, with the most impactful factors sorted on top:
+
+<br>
+
+```{r ridge_var_social_all_plot, echo=FALSE}
+# Plotting the top (up to) 15 coefficients
+PlotTitle <- "Societal factors and their impact on global happiness"
+PlotModelCoefPlotly(Model, 15, PlotTitle, LabelsMapping_Var, TRUE)
+```
+
+<br>
+
+### Model with select social variables
+
+In order for us to get an easier to interpret picture of what impacts `HappinessScore` without the added confusion of having multiple variables representing the same concept (e.g. access to clean fuels), we fit a model that contains a manually **curated list of predictors**. Those are selected based on the strength of their correlation with happiness so that we only keep the variable with the highest correlation.
+
+<br>
+
+```{r socials_var_correlations, echo=FALSE}
+# Getting the correlations of HappinessScore
+Correlations <- ST_DataForAnalysis %>%
+  select(HappinessScore, starts_with("S_")) %>%
+  correlate(method = "pearson", quiet = TRUE) %>%
+  mutate(across(everything(), ~replace_na(.x, 1))) %>%
+  focus(HappinessScore) %>%
+  mutate(HappinessScore = abs(HappinessScore)) %>%
+  arrange(desc(HappinessScore))
+
+# Exporting for the sake of documentation
+write_csv(Correlations, "Data/Correlations/Happiness and society.csv")
+
+# Deciding which variables to keep
+VarsToKeep <- c(
+  "S_AccessToCleanFuelsPctOfTotal",
+  "S_UrbanPopPctOfTotal",
+  "S_AccessToElectricityPctOfTotal",
+  "S_UpperSecEduPctOfTotal",
+  "S_CompulsoryEducationYears",
+  "S_LaborParticipRateFemale",
+  "S_PopulationAged14OrLess"
+)
+
+# Defining lambda values to use when testing models
+LambdasToTry <- seq(0, 1, 0.05)
+
+# Defining X and Y variables
+Y <- "HappinessScore"
+X <- VarsToKeep
+
+# Fitting a model and generating predictions
+Model <- FitRidgeModel(ST_DataForAnalysis, Y, X, LambdasToTry)
+Predictions <- predict(Model, data.matrix(ST_DataForAnalysis[, X]))
+```
+
+```{r ridge_var_social_rev_metrics, echo=FALSE}
+# Getting model fit metrics
+FitMetrics <- FitMetrics_Continuous(ST_DataForAnalysis[[Y]],
+                      Predictions,
+                      Model$nobs,
+                      length(X),
+                      2)
+FitMetrics
+```
+
+<br>
+
+The impact of the various factors as shown by their **coefficients** is presented below, with the most impactful factors sorted on top:
+
+<br>
+
+```{r ridge_var_social_rev_plot, echo=FALSE}
+# Plotting the top (up to) 15 coefficients
+PlotTitle <- "Societal factors and their impact on global happiness"
+PlotModelCoefPlotly(Model, 15, PlotTitle, LabelsMapping_Var, TRUE)
+```
+
+<br>
+
+As we can see from the above chart, all factors indicating a more developed society seem to have a positive effect on happiness. The exact magnitude of the effects of these political factors is shown below:
+
+<br>
+
+```{r ridge_var_society_rev_explain, echo=FALSE, warning=FALSE}
+# Getting the actual effect sizes
+EffectSizes <- GetRealEffectSize(Model, DataForAnalysis, LabelsMapping_Scale, LabelsMapping_Var)
+EffectSizes
+```
+
+<br>
+
+As we can see, increasing female labor participation rate by 10 p.p. could improve happiness by as many as `r abs(round(EffectSizes$EffectSize[EffectSizes$Variable == "Labor participation rate (female)"], 2))` points, while an increase in the share of urban population by 10 p.p. would be associated with a similar improvement in happiness (`r abs(round(EffectSizes$EffectSize[EffectSizes$Variable == "Urban population (% of total)"], 2))` points, to be specific).
+
+<br>
+
+## The relationship between the environment and happiness
+
+### Model with all environmental factors
+
+Below, we fit a ridge regression model trying to explain `HappinessScore` by the individual variables related to the state of the environment. A summary of the model's **fit metrics** is shown below:
+
+<br>
+
+```{r ridge_var_envir_all_fit, echo=FALSE}
+# Defining lambda values to use when testing models
+LambdasToTry <- seq(0, 1, 0.05)
+
+# Defining X and Y variables
+Y <- "HappinessScore"
+X <- VarsEnvironment
+
+# Fitting a model and generating predictions
+Model <- FitRidgeModel(ST_DataForAnalysis, Y, X, LambdasToTry)
+Predictions <- predict(Model, data.matrix(ST_DataForAnalysis[, X]))
+```
+
+```{r ridge_var_envir_all_metrics, echo=FALSE}
+# Getting model fit metrics
+FitMetrics <- FitMetrics_Continuous(ST_DataForAnalysis[[Y]],
+                      Predictions,
+                      Model$nobs,
+                      length(X),
+                      2)
+FitMetrics
+```
+
+<br>
+
+The impact of the various factors as shown by their **coefficients** is presented below, with the most impactful factors sorted on top:
+
+<br>
+
+```{r ridge_var_envir_all_plot, echo=FALSE}
+# Plotting the top (up to) 15 coefficients
+PlotTitle <- "Environmental factors and their impact on global happiness"
+PlotModelCoefPlotly(Model, 15, PlotTitle, LabelsMapping_Var, TRUE)
+```
+
+<br>
+
+### Model with select environmental variables
+
+In order for us to get an easier to interpret picture of what impacts `HappinessScore` without the added confusion of having multiple variables representing the same concept (e.g. total CO2 emissions), we fit a model that contains a manually **curated list of predictors**. Those are selected based on the strength of their correlation with happiness so that we only keep the variable with the highest correlation.
+
+<br>
+
+```{r envir_var_correlations, echo=FALSE}
+# Getting the correlations of HappinessScore
+Correlations <- ST_DataForAnalysis %>%
+  select(HappinessScore, starts_with("V_")) %>%
+  correlate(method = "pearson", quiet = TRUE) %>%
+  mutate(across(everything(), ~replace_na(.x, 1))) %>%
+  focus(HappinessScore) %>%
+  mutate(HappinessScore = abs(HappinessScore)) %>%
+  arrange(desc(HappinessScore))
+
+# Exporting for the sake of documentation
+write_csv(Correlations, "Data/Correlations/Happiness and environment.csv")
+
+# Deciding which variables to keep
+VarsToKeep <- c(
+  "V_CO2PerCapita",
+  "V_FertilizerUseKgPerHectare",
+  "V_AgriculturalLandPctOfTotal",
+  "V_ForestAreaPctOfTotal"
+  )
+
+# Defining lambda values to use when testing models
+LambdasToTry <- seq(0, 1, 0.05)
+
+# Defining X and Y variables
+Y <- "HappinessScore"
+X <- VarsToKeep
+
+# Fitting a model and generating predictions
+Model <- FitRidgeModel(ST_DataForAnalysis, Y, X, LambdasToTry)
+Predictions <- predict(Model, data.matrix(ST_DataForAnalysis[, X]))
+```
+
+```{r ridge_var_envir_rev_metrics, echo=FALSE}
+# Getting model fit metrics
+FitMetrics <- FitMetrics_Continuous(ST_DataForAnalysis[[Y]],
+                      Predictions,
+                      Model$nobs,
+                      length(X),
+                      2)
+FitMetrics
+```
+
+<br>
+
+The impact of the various factors as shown by their **coefficients** is presented below, with the most impactful factors sorted on top:
+
+<br>
+
+```{r ridge_var_envir_rev_plot, echo=FALSE}
+# Plotting the top (up to) 15 coefficients
+PlotTitle <- "Environmental factors and their impact on global happiness"
+PlotModelCoefPlotly(Model, 15, PlotTitle, LabelsMapping_Var, TRUE)
+```
+
+<br>
+
+As we can see from the above chart, having more CO2 per capita emissions (likely an indicator of having a more developed economy) and a more intensive use of fertilizers both a **positive effect** on happiness, as does having a larger % of forest area. The exact magnitude of the effects of these political factors is shown below:
+
+<br>
+
+```{r ridge_var_envir_rev_explain, echo=FALSE, warning=FALSE}
+# Getting the actual effect sizes
+EffectSizes <- GetRealEffectSize(Model, DataForAnalysis, LabelsMapping_Scale, LabelsMapping_Var)
+EffectSizes
+```
+
+<br>
+
+From these numbers, we can see that for instance increasing the consumption of fertilizers by 1,000 kg per hectare could improve `HappinessScore` by as many as `r abs(round(EffectSizes$EffectSize[EffectSizes$Variable == "Fertilizer consumption (kg per hectare)"], 2))` points.
+
+<br>
+
+## The relationship between the health and happiness
+
+### Model with all health-related factors
+
+Below, we fit a ridge regression model trying to explain `HappinessScore` by the individual variables related to public health. A summary of the model's **fit metrics** is shown below:
+
+<br>
+
+```{r ridge_var_health_all_fit, echo=FALSE}
+# Defining lambda values to use when testing models
+LambdasToTry <- seq(0, 1, 0.05)
+
+# Defining X and Y variables
+Y <- "HappinessScore"
+X <- VarsHealth
+
+# Fitting a model and generating predictions
+Model <- FitRidgeModel(ST_DataForAnalysis, Y, X, LambdasToTry)
+Predictions <- predict(Model, data.matrix(ST_DataForAnalysis[, X]))
+```
+
+```{r ridge_var_health_all_metrics, echo=FALSE}
+# Getting model fit metrics
+FitMetrics <- FitMetrics_Continuous(ST_DataForAnalysis[[Y]],
+                      Predictions,
+                      Model$nobs,
+                      length(X),
+                      2)
+FitMetrics
+```
+
+<br>
+
+The impact of the various factors as shown by their **coefficients** is presented below, with the most impactful factors sorted on top:
+
+<br>
+
+```{r ridge_var_health_all_plot, echo=FALSE}
+# Plotting the top (up to) 15 coefficients
+PlotTitle <- "Health-related factors and their impact on global happiness"
+PlotModelCoefPlotly(Model, 15, PlotTitle, LabelsMapping_Var, TRUE)
+```
+
+<br>
+
+What we can see from the chart above is not quite-straightforward as we have three variables that suffer from perfect multicollinearity (the three suicide rates). Therefore, we need to perform some more careful variable selection before deducing any conclusions from our tests.
+
+<br>
+
+### Model with select health-related variables
+
+In order for us to get an easier to interpret picture of what impacts `HappinessScore` without the added confusion of having multiple variables representing the same concept (e.g. total CO2 emissions), we fit a model that contains a manually **curated list of predictors**. Those are selected based on the strength of their correlation with happiness so that we only keep the variable with the highest correlation.
+
+<br>
+
+```{r health_var_correlations, echo=FALSE}
+# Getting the correlations of HappinessScore
+Correlations <- ST_DataForAnalysis %>%
+  select(HappinessScore, starts_with("H_")) %>%
+  correlate(method = "pearson", quiet = TRUE) %>%
+  mutate(across(everything(), ~replace_na(.x, 1))) %>%
+  focus(HappinessScore) %>%
+  mutate(HappinessScore = abs(HappinessScore)) %>%
+  arrange(desc(HappinessScore))
+
+# Exporting for the sake of documentation
+write_csv(Correlations, "Data/Correlations/Happiness and health.csv")
+
+# Deciding which variables to keep
+VarsToKeep <- c(
+  "H_AirPollutionMeanExpPctOfPop",
+  "H_TotalSuicideRate"
+  )
+
+# Defining lambda values to use when testing models
+LambdasToTry <- seq(0, 1, 0.05)
+
+# Defining X and Y variables
+Y <- "HappinessScore"
+X <- VarsToKeep
+
+# Fitting a model and generating predictions
+Model <- FitRidgeModel(ST_DataForAnalysis, Y, X, LambdasToTry)
+Predictions <- predict(Model, data.matrix(ST_DataForAnalysis[, X]))
+```
+
+```{r ridge_var_health_rev_metrics, echo=FALSE}
+# Getting model fit metrics
+FitMetrics <- FitMetrics_Continuous(ST_DataForAnalysis[[Y]],
+                      Predictions,
+                      Model$nobs,
+                      length(X),
+                      2)
+FitMetrics
+```
+
+<br>
+
+The impact of the various factors as shown by their **coefficients** is presented below, with the most impactful factors sorted on top:
+
+<br>
+
+```{r ridge_var_health_rev_plot, echo=FALSE}
+# Plotting the top (up to) 15 coefficients
+PlotTitle <- "Health-related factors and their impact on global happiness"
+PlotModelCoefPlotly(Model, 15, PlotTitle, LabelsMapping_Var, TRUE)
+```
+
+<br>
+
+The conclusion from the above chart is quite clear: both exposure to air pollution and a higher suicide rate are associated with a lower level of happiness. The exact magnitude of the effects is shown below:
+
+<br>
+
+```{r ridge_var_health_rev_explain, echo=FALSE, warning=FALSE}
+# Getting the actual effect sizes
+EffectSizes <- GetRealEffectSize(Model, DataForAnalysis, LabelsMapping_Scale, LabelsMapping_Var)
+EffectSizes
+```
+
+<br>
+
+Specifically, for each 10 p.p. increase in the % of population exposed to air pollution, we can expect to see a decrease in `HappinessScore` equivalent to `r abs(round(EffectSizes$EffectSize[EffectSizes$Variable == "Air pollution (mean exposure, % of population)"], 2))` points.
+
+<br>
+
+## Combined model of world happiness
+
+Below, we fit a combined ridge regression model trying to explain `HappinessScore` by all the factors at the same time. That way, we're able to simultaneously compare the importance of e.g. both economical and societal factors. A summary of the model's **fit metrics** is shown below:
+
+<br>
+
+```{r ridge_var_all_fit, echo=FALSE}
+# Defining lambda values to use when testing models
+LambdasToTry <- seq(0, 1, 0.05)
+
+# Defining X and Y variables
+Y <- "HappinessScore"
+X <- c(
+  "E_GDPPerCapitaConstant",
+  "E_PovertyGap685Headcount",
+  "E_HealthExpenditurePerCapita",
+  "E_ExportsPctOfGDP",
+  "E_GiniIndex",
+  "E_EducationExpenditurePctOfGDP",
+  "E_LaborTaxPctOfProfits",
+  "E_ConsumerPriceInflation",
+  "E_FemaleUnemployment",
+  "E_ImportsPctOfGDP",
+  "P_GovernmentEffectiveness",
+  "P_ControlOfCorruption",
+  "P_RuleOfLaw",
+  "P_CleanElectionsIndex",
+  "S_AccessToCleanFuelsPctOfTotal",
+  "S_UrbanPopPctOfTotal",
+  "S_AccessToElectricityPctOfTotal",
+  "S_UpperSecEduPctOfTotal",
+  "S_CompulsoryEducationYears",
+  "S_LaborParticipRateFemale",
+  "S_PopulationAged14OrLess",
+  "V_CO2PerCapita",
+  "V_FertilizerUseKgPerHectare",
+  "V_AgriculturalLandPctOfTotal",
+  "V_ForestAreaPctOfTotal",
+  "H_AirPollutionMeanExpPctOfPop",
+  "H_TotalSuicideRate"
+)
+
+# Exporting the list of X variables for use in other notebooks
+saveRDS(X, "Data/Clean/X_Vars.Rds")
+
+# Fitting a model and generating predictions
+Model <- FitRidgeModel(ST_DataForAnalysis, Y, X, LambdasToTry)
+Predictions <- predict(Model, data.matrix(ST_DataForAnalysis[, X]))
+```
+
+```{r ridge_var_all_metrics, echo=FALSE}
+# Getting model fit metrics
+FitMetrics <- FitMetrics_Continuous(PC_DataForAnalysis[[Y]],
+                      Predictions,
+                      Model$nobs,
+                      length(X),
+                      2)
+FitMetrics
+```
+
+<br>
+
+The impact of the **top 12 factors** regardless of their category is presented below, with the most impactful factors sorted on top:
+
+<br>
+
+```{r ridge_var_all_plot, echo=FALSE}
+# Plotting the top 12 coefficients
+PlotTitle <- "All individual variables and their impact on global happiness"
+PlotModelCoefPlotly(Model, 12, PlotTitle, LabelsMapping_Var, TRUE)
+```
+
+<br>
+
+The exact magnitude of the effects is shown below:
+
+<br>
+
+```{r ridge_var_all_explain, echo=FALSE, warning=FALSE}
+# Getting the actual effect sizes
+EffectSizes <- GetRealEffectSize(Model, DataForAnalysis, LabelsMapping_Scale, LabelsMapping_Var)
+EffectSizes
+```
+
+<br>
+
+# Conclusion
+
+Throughout this analysis, we tried to build ridge regression models that can explain `HappinessScore` as a function of various economic, political, societal, environmental and health-related factors. We went through several iterations of the models, starting with models based on principal components, which were simpler and more elegant but also more difficult to interpret. Then, we proceed with testing models containing the individual variables, which introduced some more complexity in terms of visualization but made it easier to interpret the variable coefficients.
+
+Overall, we were able to come up with a model that can predict `HappinessScore` with an average accuracy of 91% (MAPE = 8.89%), which used a total of 27 individual variables. We were also able to obtain the same level of accuracy from our model based on 19 principal components (MAPE = 9%).

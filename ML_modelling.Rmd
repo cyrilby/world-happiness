@@ -1,0 +1,888 @@
+---
+title: "World happiness study: ML modelling"
+author: "Kiril Boyanov"
+date: "`r Sys.Date()`"
+output:
+  html_document: 
+    toc: yes
+    df_print: paged
+    toc_depth: 3
+---
+
+<br>
+
+In this file, we import the already clean data (where we've also made imputations for missing values) containing all individual input variales. Then, we build a machine learning (ML) model that we can use to predict global happiness levels.
+
+<br>
+
+# Setting things up
+
+Importing relevant packages, defining custom functions, specifying local folders etc.
+
+```{r input_folder, echo = FALSE}
+# User input: specifying the local path to the folder
+# where the analysis data are to be stored
+AnalysisFolder <- "G:/My Drive/Projects/Data & statistics/Happiness insights/"
+```
+
+```{r library_import, message = FALSE, warning = FALSE}
+# Importing relevant packages
+
+# For general data-related tasks
+library(plyr)
+library(tidyverse)
+library(data.table)
+library(openxlsx)
+library(readxl)
+library(arrow)
+library(zoo)
+
+# For working with countries
+library(countrycode)
+
+# For statistical analysis and ML
+library(corrr)
+library(stats)
+library(factoextra)
+library(glmnet)
+library(modelr)
+library(e1071)
+library(randomForest)
+library(gbm)
+library(caret)
+
+# For data visualization
+library(plotly)
+library(ggplot2)
+library(gridExtra)
+```
+
+```{r custom_functions, echo=FALSE}
+# Importing custom functions created for this project
+source("Custom_functions.R")
+```
+
+<br>
+
+# User input
+
+This notebook includes performing a grid search, which is quite computationally intensive. Therefore, the user has the option to manually enable/disable this part of the process:
+
+```{r grid_search_enable, echo=FALSE}
+# Specifying whether or not to run a grid search
+RunGridSearch <- FALSE
+
+# Printing out a confirmation
+if (RunGridSearch) {
+  print("Grid search will be performed when running this notebook.")
+  print("Note: this process may take up to several hours to complete.")
+} else {
+  print("Results from a previously run grid search will be imported.")
+  print("Note: this assumes that we're using more or less the same input data.")
+}
+```
+
+<br>
+
+# Importing data
+
+We import data that was already pre-processed in the `Data_prep.Rmd` notebook and that was subjected to missing data imputation in the `Dealing_with_missing_data.Rmd` notebook. Please note that as we have two different measures of GDP included in the data, we're dropping the one that is based on current prices so as not to overestimate the importance of GDP. A preview of the data imported is shown below:
+
+```{r data_import_general, echo = FALSE}
+# Importing labels mapping primarily used for charts
+LabelsMapping_Var <- read_excel("Data/Variables mapping.xlsx") %>%
+  select(ProperName, Label) %>%
+  rename(Variable=ProperName)
+
+# Importing the data that's ready for use
+DataForAnalysis <- read_parquet(paste(AnalysisFolder, "Data/Clean/DataForAnalysisImputed.parquet", sep = ""))
+
+# Removing GDP in current prices
+DataForAnalysis <- DataForAnalysis %>%
+  select(-E_GDPPerCapitaCurrent)
+
+# Previewing the data
+head(DataForAnalysis, 5)
+```
+
+<br>
+
+The variable labels also contain some **information about the** **scaling** of these variables, which will be important for interpretation of the models tested below. Specifically, items changing on a scale different than 0-1 will be interpreted 1:1 (e.g. if Var X increased by 1, then Happiness will increase by Y), while percentage variables will be interpreted for a change by 10 p.p. The complete scaling and interpretation are shown below:
+
+```{r data_import_scaling}
+# Importing table used for defining scaling and supporting interpretation
+LabelsMapping_Scale <- read_excel("Data/Variables mapping.xlsx") %>%
+  select(ProperName, Label, Scale) %>%
+  rename(Variable=ProperName) %>%
+  select(Variable, Scale)
+
+# Defining how to interpret coefficients with different scales
+InterpretationUnits <-
+  list(
+    "Scale between 1 and 10" = 1,
+    "Scale between -2.5 and 2.5" = 0.25,
+    "Ranked order" = 1,
+    "Scale between 0 and 100" = 10,
+    "Scale between 0 and 1" = 0.1,
+    "Absolute value (large number)" = 1000,
+    "Absolute value (small number)" = 1,
+    "Percent" = 10,
+    "Rate per 100,000" = 1,
+    "Irrelevant" = 1
+  )
+
+# Defining how to interpret coefficients with different scales
+InterpretationDescriptions <-
+  list(
+    "Scale between 1 and 10" = "Change in Y for 1 unit change in X",
+    "Scale between -2.5 and 2.5" = "Change in Y for .25 units change in X",
+    "Ranked order" = "Change in Y for 1 unit change in X",
+    "Scale between 0 and 100" = "Change in Y for 10 p.p. change in X",
+    "Scale between 0 and 1" = "Change in Y for 10 p.p. change in X",
+    "Absolute value (large number)" = "Change in Y for 1,000 units change in X",
+    "Absolute value (small number)" = "Change in Y for 1 unit change in X",
+    "Percent" = "Change in Y for 10 p.p. change in X",
+    "Rate per 100,000" = "Change in Y for 1 unit change in X",
+    "Irrelevant" = "Change in Y for 1 unit change in X"
+  )
+
+# Adding the definition to the mapping table
+LabelsMapping_Scale$ScaleFactor <- unlist(InterpretationUnits[LabelsMapping_Scale$Scale])
+LabelsMapping_Scale$ScaleDescription <- unlist(InterpretationDescriptions[LabelsMapping_Scale$Scale])
+
+# Re-ordering variables and previewing
+LabelsMapping_Scale <- LabelsMapping_Scale %>%
+  select(Variable, ScaleFactor, ScaleDescription, Scale)
+LabelsMapping_Scale
+```
+
+```{r defining_years, warning = FALSE,  echo = FALSE}
+# Finding out which year contains the most recent happiness data
+NoMissings <- DataForAnalysis %>%
+  drop_na()
+MostRecentCompleteYear <- max(NoMissings$Year)
+```
+
+<br>
+
+# Preparing data for analysis
+
+## Method description
+
+As part of the process, we split the data into a training, validation and test set, with a more detailed description of this process available in the table below:
+
+| Dataset        | Definition                                                                                 | Purpose                                                                                                               |
+|------------------|------------------------|------------------------------|
+| Training set   | Data from all years except for the most recent year with available `HappinessScore` (2022) | Used to train our ML model so that it can learn how to predict `HappinessScore` from patterns seen in historical data |
+| Validation set | Data from the most recent year with available `HappinessScore` (2022)                      | Used to fine-tune the hyperparameters of the ML model so as to maximize the model's accuracy without overfitting      |
+| Test set       | ⅓ randomly selected observations from the validation set                                   | Used to get a more reliable estimate of the model's performance on unseen data                                        |
+
+<br>
+
+The core idea of this data is split is to **avoid overfitting**, i.e. a situation where a model is fitted too closely to a limited set of data points, thus making it biased and inaccurate for new or unseen data. By training the model on some data points and evaluating its performance on different data points, we reduce the likelihood of ending up with a model that does not generalize well to new data.
+
+<br>
+
+## Standardizing the data
+
+For some model types such as ridge regression and support vectors regression (SVR), we need to scale the data using the mean and the standard deviation before we can build any models, so we do this before splitting the data into different sets.
+
+```{r standardize_data, echo=FALSE}
+# Defining which columns need scaling
+ColsToScale <- names(DataForAnalysis)[9:length(names(DataForAnalysis))]
+
+# Standardizing all potential independent variables
+ST_DataForAnalysis <- DataForAnalysis %>%
+  mutate(across(all_of(ColsToScale), ~ scale(.)))
+```
+
+## Splitting the data for training, validation and testing
+
+**Note**: to ensure reproducibility of the results, we use `set.seed()` so that we always get the same observations in our test set.
+
+A preview of the number of observations in each dataset is shown below:
+
+<br>
+
+```{r split_data, echo=FALSE}
+# Setting the seed for reproducibility
+set.seed(599)
+
+# Splitting the data into training and validation set
+DataForTrain <- DataForAnalysis %>%
+  filter(Year != MostRecentCompleteYear)
+ST_DataForTrain <- ST_DataForAnalysis %>%
+  filter(Year != MostRecentCompleteYear)
+DataForVal <- DataForAnalysis %>%
+  filter(Year == MostRecentCompleteYear)
+ST_DataForVal <- ST_DataForAnalysis %>%
+  filter(Year == MostRecentCompleteYear)
+
+# Defining a random sample of 33% of DataForVal and using it as test set
+SampleSize <- round(0.33 * nrow(DataForVal))
+SampleIndices <- sample(nrow(DataForVal), SampleSize)
+DataForTest <- DataForVal[SampleIndices, , drop = FALSE]
+ST_DataForTest <- ST_DataForVal[SampleIndices, , drop = FALSE]
+
+# Printing a confirmation
+print(sprintf("N of obs in training set: %i", nrow(DataForTrain)))
+print(sprintf("N of obs in validation set: %i", nrow(DataForVal)))
+print(sprintf("N of obs in test set: %i", nrow(DataForTest)))
+
+# Removing the random state
+set.seed(NULL)
+```
+
+<br>
+
+## Defining which variables to use
+
+The decision of exactly which variables to include in our predictive model(s) is based on our findings from the `Ridge_regression_analysis.Rmd` notebook, where we explored different combinations of variables.
+
+A **full list of all input variables** fed into the models tested below is presented in here:
+
+<br>
+
+```{r defining_vars, echo=FALSE}
+# Defining Y variable
+Y <- "HappinessScore"
+
+# Importing the list of X variables for use in models as defined
+# in our "Ridge_regression_analysis.Rmd" notebook
+X <- readRDS("Data/Clean/X_Vars.Rds")
+print(X)
+```
+
+<br>
+
+# Tentative ML modelling
+
+In this section, we fit several kinds of machine learning (ML) models that use the same input variables (features) without performing any model optimization. We do this so that we can determine which model type is **most suitable for predicting** `HappinessScore`, which we can then optimize in the subsequent section.
+
+<br>
+
+## Ridge regression model
+
+[Comments on model type:]{.underline}
+
+-   This is the simplest approach of all and the least computationally intensive
+
+-   Ridge regression models require standardized variables as input and allow for variables that are correlated with each other among the features
+
+-   Some model optimization is performed already here by varying the lambda value, though other parameters may need to be optimized at a later stage
+
+-   Ridge regression models assume linear relationships between the X and Y variables
+
+<br>
+
+```{r tentative_ridge_fit, echo=FALSE}
+# Defining lambda values to use when testing models
+LambdasToTry <- seq(0, 1, 0.05)
+
+# Fitting a model and generating predictions for validation and test set
+Model <- FitRidgeModel(ST_DataForAnalysis, Y, X, LambdasToTry)
+PredictionsForVal <- predict(Model, data.matrix(ST_DataForVal[, X]))
+PredictionsForTest <- predict(Model, data.matrix(ST_DataForTest[, X]))
+```
+
+The performance of the ridge regression model on the **validation set** is shown below:
+
+<br>
+
+```{r tentative_ridge_metrics_val, echo=FALSE}
+# Getting model fit metrics for the validation set
+FitMetricsVal <- FitMetrics_Continuous(ST_DataForVal[[Y]],
+                      PredictionsForVal,
+                      nrow(DataForVal),
+                      length(X),
+                      2)
+FitMetricsVal
+```
+
+<br>
+
+The performance of the ridge regression model on the **test set** is shown below:
+
+<br>
+
+```{r tentative_ridge_metrics_test, echo=FALSE}
+# Getting model fit metrics for the test set
+FitMetricsTest <- FitMetrics_Continuous(ST_DataForTest[[Y]],
+                      PredictionsForTest,
+                      nrow(DataForTest),
+                      length(X),
+                      2)
+FitMetricsTest
+```
+
+```{r tentative_ridge_metrics_range, echo=FALSE}
+# Getting the range for select model metrics
+RangeForMAPE <- GetMetricRange(FitMetricsVal, FitMetricsTest, "MAPE", 1)
+RangeForAdjR2 <- GetMetricRange(FitMetricsVal, FitMetricsTest, "Adj_R2", 1)
+```
+
+<br>
+
+```{r tentative_ridge_plot, echo=FALSE, message=FALSE}
+# Making actual vs. predicted plots and residuals plots
+PlotModelOutput(DataForVal[[Y]],
+                PredictionsForVal,
+                DataForTest[[Y]],
+                PredictionsForTest)
+```
+
+<br>
+
+[Comments on model performance:]{.underline}
+
+-   The initial results in here are encouraging, with the **MAPE** of the model ranging between `r RangeForMAPE`% depending on the dataset used to evaluate it
+
+-   The **adjusted R2** score is also reasonably high, though not indicative of overfitting, ranging between `r RangeForAdjR2`%
+
+-   The **plots** confirm the conclusions of the MAPE and R2 scores, though it seems like there is less accuracy in the predictions where `HappinessScore` has lower values
+
+<br>
+
+## Support vector regression (SVR) model
+
+[Comments on model type:]{.underline}
+
+-   Support vector regression (SVR) models require standardized variables as input and allow for variables that are correlated with each other among the features
+
+-   SVR models also allow for having some degree of correlation in the input variables as well as for non-linear relationships between the X and Y variables (depending on the kernel of choice)
+
+<br>
+
+```{r tentative_SVR_fit, echo=FALSE}
+# Defining model formula
+ModelFormula <- paste(Y, " ~ ", paste(X, collapse = " + "), sep = "")
+ModelFormula <- as.formula(ModelFormula)
+
+# Making this example reproducible
+set.seed(703)
+
+# Fitting a model and generating predictions for validation and test set
+Model <- svm(ModelFormula, ST_DataForTrain)
+PredictionsForVal <- predict(Model, data.matrix(ST_DataForVal[, X]))
+PredictionsForTest <- predict(Model, data.matrix(ST_DataForTest[, X]))
+
+# Re-setting the random state
+set.seed(NULL)
+```
+
+The performance of the SVR model on the **validation set** is shown below:
+
+<br>
+
+```{r tentative_SVR_metrics_val, echo=FALSE}
+# Getting model fit metrics for the validation set
+FitMetricsVal <- FitMetrics_Continuous(ST_DataForVal[[Y]],
+                      PredictionsForVal,
+                      nrow(DataForVal),
+                      length(X),
+                      2)
+FitMetricsVal
+```
+
+<br>
+
+The performance of the SVR model on the **test set** is shown below:
+
+<br>
+
+```{r tentative_SVR_metrics_test, echo=FALSE}
+# Getting model fit metrics for the test set
+FitMetricsTest <- FitMetrics_Continuous(ST_DataForTest[[Y]],
+                      PredictionsForTest,
+                      nrow(DataForTest),
+                      length(X),
+                      2)
+FitMetricsTest
+```
+
+```{r tentative_SVR_metrics_range, echo=FALSE}
+# Getting the range for select model metrics
+RangeForMAPE <- GetMetricRange(FitMetricsVal, FitMetricsTest, "MAPE", 1)
+RangeForAdjR2 <- GetMetricRange(FitMetricsVal, FitMetricsTest, "Adj_R2", 1)
+```
+
+<br>
+
+```{r tentative_SVR_plot, echo=FALSE, message=FALSE}
+# Making actual vs. predicted plots and residuals plots
+PlotModelOutput(DataForVal[[Y]],
+                PredictionsForVal,
+                DataForTest[[Y]],
+                PredictionsForTest)
+```
+
+<br>
+
+[Comments on model performance:]{.underline}
+
+-   Compared to the ridge regression model, the SVR models performs substantially better, with the **MAPE** of the model ranging between `r RangeForMAPE`% depending on the dataset used to evaluate it
+
+-   The **adjusted R2** score is also reasonably high, though not indicative of overfitting, ranging between `r RangeForAdjR2`%
+
+-   The **plots** confirm the conclusions of the MAPE and R2 scores, though it seems like there is less accuracy in the predictions where `HappinessScore` has lower values
+
+<br>
+
+## Random forest model
+
+[Comments on model type:]{.underline}
+
+-   This model type is suitable for working with many different columns without having to make assumptions about the distribution of the data or multicollinearity
+
+-   Random forest models can account for potentially non-linear relationships
+
+-   By fitting many different estimators and averaging them, we are better equipped to avoid overfitting
+
+<br>
+
+```{r tentative_RF_fit, echo=FALSE}
+# Defining model formula
+ModelFormula <- paste(Y, " ~ ", paste(X, collapse = " + "), sep = "")
+ModelFormula <- as.formula(ModelFormula)
+
+# Making this example reproducible
+set.seed(568)
+
+# Fitting a model and generating predictions for validation and test set
+Model <- randomForest(ModelFormula, DataForTrain)
+PredictionsForVal <- predict(Model, data.matrix(DataForVal[, X]))
+PredictionsForTest <- predict(Model, data.matrix(DataForTest[, X]))
+
+# Re-setting the random state
+set.seed(NULL)
+```
+
+The performance of the random forest model on the **validation set** is shown below:
+
+<br>
+
+```{r tentative_RF_metrics_val, echo=FALSE}
+# Getting model fit metrics for the validation set
+FitMetricsVal <- FitMetrics_Continuous(DataForVal[[Y]],
+                      PredictionsForVal,
+                      nrow(DataForVal),
+                      length(X),
+                      2)
+FitMetricsVal
+```
+
+<br>
+
+The performance of the random forest model on the **test set** is shown below:
+
+<br>
+
+```{r tentative_RF_metrics_test, echo=FALSE}
+# Getting model fit metrics for the test set
+FitMetricsTest <- FitMetrics_Continuous(DataForTest[[Y]],
+                      PredictionsForTest,
+                      nrow(DataForTest),
+                      length(X),
+                      2)
+FitMetricsTest
+```
+
+```{r tentative_RF_metrics_range, echo=FALSE}
+# Getting the range for select model metrics
+RangeForMAPE <- GetMetricRange(FitMetricsVal, FitMetricsTest, "MAPE", 1)
+RangeForAdjR2 <- GetMetricRange(FitMetricsVal, FitMetricsTest, "Adj_R2", 1)
+```
+
+<br>
+
+```{r tentative_RF_plot, echo=FALSE, message=FALSE}
+# Making actual vs. predicted plots and residuals plots
+PlotModelOutput(DataForVal[[Y]],
+                PredictionsForVal,
+                DataForTest[[Y]],
+                PredictionsForTest)
+```
+
+<br>
+
+[Comments on model performance:]{.underline}
+
+-   The random forest model outperforms all other models tested until this point, with the **MAPE** of the model ranging between `r RangeForMAPE`% depending on the dataset used to evaluate it
+
+-   The **adjusted R2** score is also reasonably high, though not indicative of overfitting, ranging between `r RangeForAdjR2`%
+
+-   The **plots** confirm the conclusions of the MAPE and R2 scores, though it seems like there is less accuracy in the predictions where `HappinessScore` has lower values
+
+<br>
+
+## Gradient boosting model
+
+[Comments on model type:]{.underline}
+
+-   This model type is suitable for working with many different columns without having to make assumptions about the distribution of the data or multicollinearity
+
+-   Like random forest models, gradient boosting models can account for potentially non-linear relationships
+
+-   By fitting many different estimators and averaging them, we are better equipped to avoid overfitting, though to a lesser extent compared to random forest models as each estimator is built incorporating learnings from the previously fitted estimators
+
+<br>
+
+```{r tentative_GBM_fit, echo=FALSE}
+# Making this example reproducible
+set.seed(314)
+
+# Defining model formula
+ModelFormula <- paste(Y, " ~ ", paste(X, collapse = " + "), sep = "")
+ModelFormula <- as.formula(ModelFormula)
+
+# Choosing the number of trees to use in the model
+N_Trees <- 250
+
+# Fitting a model and generating predictions for validation and test set
+Model <-
+  gbm(
+    ModelFormula,
+    data = DataForTrain,
+    distribution = "gaussian",
+    n.trees = N_Trees
+  )
+PredictionsForVal <- predict(Model, DataForVal[, X], n.trees = N_Trees)
+PredictionsForTest <- predict(Model, DataForTest[, X], n.trees = N_Trees)
+
+# Re-setting the random state
+set.seed(NULL)
+```
+
+The performance of the gradient boosting model on the **validation set** is shown below:
+
+<br>
+
+```{r tentative_GBM_metrics_val, echo=FALSE}
+# Getting model fit metrics for the validation set
+FitMetricsVal <- FitMetrics_Continuous(DataForVal[[Y]],
+                      PredictionsForVal,
+                      nrow(DataForVal),
+                      length(X),
+                      2)
+FitMetricsVal
+```
+
+<br>
+
+The performance of the gradient boosting model on the **test set** is shown below:
+
+<br>
+
+```{r tentative_GBM_metrics_test, echo=FALSE}
+# Getting model fit metrics for the test set
+FitMetricsTest <- FitMetrics_Continuous(DataForTest[[Y]],
+                      PredictionsForTest,
+                      nrow(DataForTest),
+                      length(X),
+                      2)
+FitMetricsTest
+```
+
+<br>
+
+```{r tentative_GBM_plot, echo=FALSE, message=FALSE}
+# Making actual vs. predicted plots and residuals plots
+PlotModelOutput(DataForVal[[Y]],
+                PredictionsForVal,
+                DataForTest[[Y]],
+                PredictionsForTest)
+```
+
+<br>
+
+[Comments on model performance:]{.underline}
+
+-   The gradient boosting model performs better than ridge regression but worse than both SVR and random forest regression, with the **MAPE** of the model ranging between `r RangeForMAPE`% depending on the dataset used to evaluate it
+
+-   The **adjusted R2** score is also reasonably high, though not indicative of overfitting, ranging between `r RangeForAdjR2`%
+
+-   The **plots** confirm the conclusions of the MAPE and R2 scores, though it seems like there is less accuracy in the predictions where `HappinessScore` has lower values
+
+-   Based on this result, it'd be best to **continue with** a random forest model
+
+<br>
+
+# Definitive modelling
+
+In this section, we expand on our finding that a **random forest model** would be the most suitable way to predict `HappinessScore`. We do so by first optimizing the hyperparameters of the model, after which point we re-evaluate the accuracy of the model and export our findings so that the model can be used to make future predictions in the `Predicting_future_happiness.Rmd` notebook.
+
+<br>
+
+## Model optimization via grid search
+
+Here, we use a grid search to find the most optimal values for the model's hyperparameters. The model is trained using the **training set**, while the parameters are optimized based on the model's performance on the **validation set**.
+
+[The exact procedure is as follows:]{.underline}
+
+1.  We get the relevant set of hyperparameters (`mtry`, `ntree` and `nodesize`) to optimize and their values.
+    1.  `mtry` is the number of variables randomly sampled as candidates at each split in the tree building process (by default, it's equal to one third of the number of X variables).
+    2.  `ntree` is the number of trees that the random forest consists of (by default, it's equal to 500).
+    3.  `nodesize` is the number of terminal nodes in each tree and is inversely proportional to the size of the trees (a higher value in higher will result in smaller trees; by default, it's equal to 5).
+2.  We fit a model based on the training set, then use it to generate predictions for the validation set.
+3.  We calculate the model fit metrics based on the validation set.
+4.  We repeat this process for a total of 5 times (to ensure proper **cross-validation**).
+
+[Good to know:]{.underline}
+
+-   The possible values of the **hyperparameters** are based on commonly used values adjusted for the size and shape of the dataset (number of observations and number of features).
+
+-   The results of the search are **exported** to `Data/Output` so that they can be used for making predictions in a different notebook.
+
+-   Please note that if the user has specified so through the `RunGridSearch` variable, the results from a **previously executed grid search** will be imported to save time and spare on resources.
+
+```{r model_grid_search, echo=FALSE}
+# Note: running the grid search is conditional on user input
+if (RunGridSearch) {
+  # Defining the number of cross-validations
+  NumberOfCV <- 5
+  
+  # Dynamically specifying the N of X vars to use when splitting data in a RF model
+  MtryRange <- c()
+  Divisions <- c(2:8)
+  for (div in Divisions) {
+    div <- as.integer(round(length(X) / div))
+    MtryRange <- append(MtryRange, div)
+  }
+  
+  # Defining the parameter grid to search
+  ParamGrid <- expand.grid(
+    param_mtry = MtryRange,
+    param_ntree = c(100, 500, 1000, 1500),
+    param_nodesize = c(3, 5, 7, 10)
+  )
+  
+  # Initializing data frame to store the results of all model runs
+  GridMetricsVal <- data.frame()
+  
+  for (i in 1:nrow(ParamGrid)) {
+    # Getting the model parameters to test
+    grid_mtry <- ParamGrid$param_mtry[i]
+    grid_ntree <- ParamGrid$param_ntree[i]
+    grid_nodesize <- ParamGrid$param_nodesize[i]
+    
+    # Printing the model configuration being tested to the user
+    print(
+      sprintf(
+        "Fitting a model with 'mtry' of %i, 'ntree' of %i and 'nodesize' of %i.",
+        grid_mtry,
+        grid_ntree,
+        grid_nodesize
+        
+      )
+    )
+    
+    for (i in c(1:NumberOfCV)) {
+      # Fitting a model and generating predictions for validation set
+      Model <-
+        randomForest(
+          form = ModelFormula,
+          data = DataForTrain,
+          mtry = grid_mtry,
+          ntree = grid_ntree,
+          nodesize = grid_nodesize
+        )
+      PredictionsForVal <-
+        predict(Model, data.matrix(DataForVal[, X]))
+      
+      # Getting model fit metrics
+      FitMetricsVal <- FitMetrics_Continuous(DataForVal[[Y]],
+                                             PredictionsForVal,
+                                             nrow(DataForVal),
+                                             length(X),
+                                             2)
+      
+      # Adding info on the parameters used to fit the model
+      FitMetricsVal$mtry <- grid_mtry
+      FitMetricsVal$ntree <- grid_ntree
+      FitMetricsVal$nodesize <- grid_nodesize
+      FitMetricsVal$run <- i
+      
+      # Appending the fit results to the initialized empty data frame
+      GridMetricsVal <-
+        plyr::rbind.fill(GridMetricsVal, FitMetricsVal)
+    }
+  }
+} else {
+  print("Note: running grid search skipped based on user input.")
+  print("Results from a previously executed grid search will be imported instead.")
+}
+```
+
+```{r model_grid_summary, echo=FALSE, message=FALSE}
+if (RunGridSearch) {
+  # Aggregating the different metrics for each combination of hyperparameters
+  GridMetricsValSummary <- GridMetricsVal %>%
+    group_by(Metric, mtry, ntree, nodesize) %>%
+    summarize(MeanValue = mean(Value, na.rm = TRUE)) %>%
+    mutate(MeanValue = round(MeanValue, 2)) %>%
+    pivot_wider(
+      id_cols = c(mtry, ntree, nodesize),
+      names_from = Metric,
+      values_from = MeanValue
+    )
+  
+  # We sort by MAPE as this is our primary metric
+  GridMetricsValSummary <- GridMetricsValSummary %>%
+    arrange(MAPE)
+  
+  # Exporting all and mean metrics from the grid search
+  write_csv(GridMetricsVal,
+            "Data/Output/RandomForest_GridSearch_All.csv")
+  write_csv(GridMetricsValSummary,
+            "Data/Output/RandomForest_GridSearch_Summary.csv")
+  print("Grid search results have been successfully exported to 'Data/Output/'.")
+} else {
+  GridMetricsVal <-
+    read_csv("Data/Output/RandomForest_GridSearch_All.csv")
+  GridMetricsValSummary <-
+    read_csv("Data/Output/RandomForest_GridSearch_Summary.csv")
+  print("Results from previously executed grid search successfully imported.")
+}
+
+# Printing the 10 best performing models
+head(GridMetricsValSummary, 10)
+```
+
+```{r model_grid_best, echo=FALSE}
+# Finding the best performing model parameters
+best_mtry <- GridMetricsValSummary$mtry[1]
+best_ntree <- GridMetricsValSummary$ntree[1]
+best_nodesize <- GridMetricsValSummary$nodesize[1]
+```
+
+<br>
+
+Based on our grid search, we can conclude that the best performing model is one where `mtry` = `r best_mtry`, `ntree` = `r best_ntree` and `nodesize` = `r best_nodesize`.
+
+<br>
+
+## Fitting best model and re-evaluating performance
+
+In this section, we fit the best performing model and evaluate its performance on both the validation and the test set so that we can get an indication of how the model **performs on unseen data**. This is useful for knowing how accurate predictions for future time periods will be, assuming that the relationships between `HappinessScore` and the input data remains unchanged.
+
+```{r model_final_fit, echo=FALSE}
+# Defining model formula
+ModelFormula <-
+  paste(Y, " ~ ", paste(X, collapse = " + "), sep = "")
+ModelFormula <- as.formula(ModelFormula)
+
+# Making this example reproducible
+random_seed <- 568
+set.seed(random_seed)
+
+# Fitting a model and generating predictions for validation and test set
+print("Fitting random forest model with the following parameters:")
+print(
+  sprintf(
+    "mtry: %i, ntree: %i, nodesize: %i, random state: %i",
+    best_mtry,
+    best_ntree,
+    best_nodesize,
+    random_seed
+  )
+)
+Model <- randomForest(
+  form = ModelFormula,
+  data = DataForTrain,
+  mtry = best_mtry,
+  ntree = best_ntree,
+  nodesize = best_nodesize
+)
+PredictionsForVal <- predict(Model, data.matrix(DataForVal[, X]))
+PredictionsForTest <- predict(Model, data.matrix(DataForTest[, X]))
+
+# Re-setting the random state
+set.seed(NULL)
+```
+
+```{r model_final_metrics_val, echo=FALSE}
+# Getting model fit metrics for the validation set
+FitMetricsVal <- FitMetrics_Continuous(DataForVal[[Y]],
+                      PredictionsForVal,
+                      nrow(DataForVal),
+                      length(X),
+                      2)
+FitMetricsVal
+```
+
+```{r model_final_metrics_test, echo=FALSE}
+# Getting model fit metrics for the test set
+FitMetricsTest <- FitMetrics_Continuous(DataForTest[[Y]],
+                      PredictionsForTest,
+                      nrow(DataForTest),
+                      length(X),
+                      2)
+FitMetricsTest
+```
+
+```{r model_final_metrics_range, echo=FALSE}
+# Getting the range for select model metrics
+RangeForMAPE <- GetMetricRange(FitMetricsVal, FitMetricsTest, "MAPE", 1)
+RangeForAdjR2 <- GetMetricRange(FitMetricsVal, FitMetricsTest, "Adj_R2", 1)
+```
+
+<br>
+
+```{r model_final_plot, echo=FALSE, message=FALSE}
+# Making actual vs. predicted plots and residuals plots
+PlotModelOutput(DataForVal[[Y]],
+                PredictionsForVal,
+                DataForTest[[Y]],
+                PredictionsForTest)
+```
+
+<br>
+
+[Comments on model performance:]{.underline}
+
+-   Based on the **actual vs. predicted** **plots**, we can conclude that the model generally does a great job at predicting `HappinessScore` on both the validation and the test set, with the actual and predicted values being very close to each other
+
+-   Based on the **residuals plots**, we can conclude that the model is better at predicting `HappinessScore` when the values of the latter are higher rather than lower, although variation seems to be roughly the same once we take outliers out from our analysis
+
+-   As we can see from both the validation and the test set, our optimized random forest model outperforms all other models tested in this notebook, with the **MAPE** of the model ranging between `r RangeForMAPE`%, which is an almost excellent result
+
+-   The **adjusted R2** score is also quite high, ranging between `r RangeForAdjR2`%which may suggest some degree of overfitting, however, the model's performance on unseen data as measured by metrics such as the MAPE score or the normalized MAE and RMSE scores shows us that overfitting is not a real concern in this case and that the model is suitable for **making predictions**
+
+<br>
+
+## Exporting results for use in prediction
+
+In here, we export the model, its parameters and the fit metrics for both the validation and the test set to the `Data/Output/` folder so that they can be used for generating predictions in other notebooks.
+
+```{r model_final_export, echo=FALSE}
+# Exporting the model itself
+saveRDS(Model, "Data/Output/RF_ModelOfHappiness.Rds")
+
+# Exporting the parameters of the best performing model
+ModelParams <-
+  list(
+    "best_mtry" = best_mtry,
+    "best_ntree" = best_ntree,
+    "best_nodesize" = best_nodesize,
+    "random_seed" = random_seed
+  )
+saveRDS(ModelParams, "Data/Output/ModelParams.Rds")
+
+# Exporting the fit metrics of the best performing model
+FitMetricsVal <- FitMetricsVal %>%
+  rename(ValueForValSet = Value)
+FitMetricsTest <- FitMetricsTest %>%
+  rename(ValueForTestSet = Value)
+ModelFitMetrics <- FitMetricsVal %>%
+  left_join(FitMetricsTest, by = "Metric")
+write_csv(ModelFitMetrics, "Data/Output/ModelFitMetrics.csv")
+
+# Confirming success
+print("The best performing model's parameters and fit metrics have been successfully exported to 'Data/Output/'.")
+```
+
+<br>
+
+# Conclusion
+
+In this notebook, we imported our pre-processed data alongside a list of variables which were found to have a substantial impact on `HappinessScore` through our ridge regression analysis. Following this, we tested a series of different statistical/machine learning models and their ability to predict `HappinessScore` based on our set of input data. Among those, the most suitable modelling approach turned out to be the use of a random forest regressor, the hyperparameters of which were optimized through a grid search. With an MAPE score of less than 4%, we ended up with a model that can generate reliable predictions for the future state of happiness, provided that the relationship between happiness and the input data remain the same.

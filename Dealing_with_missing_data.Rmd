@@ -1,0 +1,437 @@
+---
+title: 'World happiness study: dealing with missing data'
+output:
+  html_document: 
+    toc: yes
+    toc_depth: 1
+    df_print: kable
+---
+
+<br/>
+
+```{r document_details, echo = FALSE}
+cat(" Author: Kiril Boyanov (kirilboyanov [at] gmail.com)\n", "LinkedIn: www.linkedin.com/kirilboyanov/\n", "Last update:", format(Sys.Date(), "%Y-%m-%d"))
+```
+
+<br/>
+
+In this file, we explore the correlations between happiness and a series of economic, political, societal, environmental and health-related factors. We perform this investigation both by using the most recent data and by looking at historical data so as to see whether the correlations change across time. Additionally, we explore within-country correlations to see whether the strongly correlated factors are mostly the same or different for each country.
+
+<br/>
+
+# Setting things up
+
+Importing relevant packages, defining custom functions, specifying local folders etc.
+
+```{r input_folder, echo = FALSE}
+# User input: specifying the local path to the folder
+# where the analysis data are to be stored
+AnalysisFolder <- "G:/My Drive/Projects/Data & statistics/Happiness insights/"
+```
+
+```{r library_import, message = FALSE, warning = FALSE}
+# Importing relevant packages
+
+# For general data-related tasks
+library(plyr)
+library(tidyverse)
+library(data.table)
+library(openxlsx)
+library(readxl)
+library(arrow)
+
+# For dealing with missing values
+library(mice)
+
+# For working with countries
+library(countrycode)
+
+# For data visualization
+library(ggplot2)
+library(plotly)
+```
+
+```{r custom_functions, echo=FALSE}
+# Importing custom functions created for this project
+source("Custom_functions.R")
+```
+
+<br/>
+
+# User input
+
+Throughout the analysis, we will be using a common `BaseYear` (to represent the past state of happiness) and a common `ReferenceYear` (to represent the most recent state of happiness). To ensure consistency across files, these two years are stored in a TXT file, which is imported below.
+
+Thus, we use the following years as base and reference:
+
+```{r params_import, warning = FALSE,  echo = FALSE}
+# Importing the parameters
+YearsToUse <- readLines(paste(AnalysisFolder, "Years to use.txt", sep = ""))
+YearsToUse <- unlist(str_split(YearsToUse, ","))
+BaseYear <- as.numeric(YearsToUse[1])
+ReferenceYear <- as.numeric(YearsToUse[2])
+rm(YearsToUse)
+
+# Printing a confirmation
+cat("Base year: ", BaseYear, "\n")
+cat("Reference year: ", ReferenceYear)
+```
+
+<br/>
+
+# Importing & merging data
+
+We import data that was already pre-processed in the `WHR_data_prep.Rmd` notebook. In here, we use many different data sources, previews of which are available in the following sub-sections.
+
+## Happiness data
+
+```{r data_import_happiness, echo = FALSE}
+# Importing data and creating RowID to use for merging with other sources
+Happiness <- read_parquet(paste(AnalysisFolder, "Data/Clean/Happiness.parquet", sep = "")) %>%
+  filter(!is.na(CountryCode)) %>%
+  mutate(RowID = paste(CountryCode, Year, sep = "_"))
+
+# Creating a country ranking for each year and adding continent based on the WB's definition
+Happiness <- Happiness %>%
+  arrange(desc(Year), desc(HappinessScore)) %>%
+  group_by(Year) %>%
+  mutate(CountryRank = row_number()) %>%
+  ungroup() %>%
+  mutate(Continent = countrycode(CountryCode, "iso3c", "continent"),
+         Region = countrycode(CountryCode, "iso3c", "region")
+         )
+
+# Previewing the data
+head(Happiness, 5)
+```
+
+<br/>
+
+## Background data
+
+Note that we have several similar measures, e.g. GDP in constant vs. current prices. While they convey what is essentially the same information, it's too early to remove them: we need to see which ones are the most strong correlates to make this decision.
+
+```{r data_import_background, echo = FALSE}
+# Importing the data
+BackgroundData <- read_parquet(paste(AnalysisFolder, "Data/Clean/BackgroundData.parquet", sep = ""))
+
+# Previewing the data
+head(BackgroundData, 5)
+```
+
+<br/>
+
+## Merging happiness data with background data
+
+The data in here was already put together in the `WHR_data_prep.Rmd` notebook, so in here, we merely need to merge it with the data on happiness data. In here, it's important to take note of variables that may have too many **missing values** as this might impact the overall data quality and make some types of analysis unfeasible.
+
+```{r data_merge, echo = FALSE}
+# Removing duplicate columns from the background data
+BackgroundData <- BackgroundData %>%
+  select(-CountryISO3, -Country, -Year) %>%
+  distinct(RowID, .keep_all = TRUE)
+
+# Merging the data and moving text-based columns to the LHS of the df
+DataForAnalysis <- Happiness %>%
+  left_join(BackgroundData, by = "RowID") %>%
+  relocate(Country, CountryCode, RowID, Continent, Region, Year, HappinessScore, CountryRank)
+```
+
+The table below shows **all available indicators**, their respective categories as well as the percentage of missing values in each column:
+
+```{r indicators_preview, echo = FALSE}
+# Putting the indicators in their own table
+Indicators <- names(DataForAnalysis)
+Indicators <- data.frame(Indicators)
+names(Indicators) <- c("Indicator")
+Indicators <- Indicators %>%
+  mutate(Area = str_sub(Indicator, 1, 2),
+         Area = case_when(Area == "P_" ~ "Political",
+                          Area == "S_" ~ "Societal",
+                          Area == "E_" ~ "Economic",
+                          Area == "V_" ~ "Environmental",
+                          Area == "H_" ~ "Health-related")
+         ) %>%
+  filter(!is.na(Area)) %>%
+  select(Area, Indicator)
+
+# Filtering the data to cover the base/reference years only
+DataForBaseYear <- DataForAnalysis %>%
+  filter(Year == BaseYear)
+DataForReferenceYear <- DataForAnalysis %>%
+  filter(Year == ReferenceYear)
+
+# Calculating all-time data availability by column
+Indicators <- Indicators %>%
+  mutate(PctMissing_AllTime = check_data_avail(DataForAnalysis, Indicators$Indicator, "missing"),
+         PctMissing_BaseYear = check_data_avail(DataForBaseYear, Indicators$Indicator, "missing"),
+         PctMissing_RefYear = check_data_avail(DataForReferenceYear, Indicators$Indicator, "missing")
+         )
+
+# Previewing the data
+Indicators
+```
+
+<br/>
+
+# Dealing with missing data
+
+As we saw in the table with the various indicators above, we do have a rather elevated share of missing data for some columns. This makes these columns rather unusable for analytic purposes if left untreated. Therefore, we need to have a **strategy** for dealing with missing data.
+
+<br/>
+
+## Exploring data availability across time
+
+However, as the chart below shows, the availability of the data **varies across time**, so it may not be wise to apply the same strategy:
+
+```{r data_availability_check, echo = FALSE}
+# Aggregating data
+DataForChart <- Indicators %>%
+  group_by(Area) %>%
+  summarize(AvgPctMissing_AllTime = mean(PctMissing_AllTime),
+            AvgPctMissing_BaseYear = mean(PctMissing_BaseYear),
+            AvgPctMissing_RefYear = mean(PctMissing_RefYear)
+            )
+
+# Pivoting the data in a format more suitable for charting
+DataForChart <- DataForChart %>%
+  pivot_longer(c(AvgPctMissing_AllTime, AvgPctMissing_BaseYear, AvgPctMissing_RefYear)) %>%
+  mutate(TimePeriod = case_when(name == "AvgPctMissing_AllTime" ~ "All time",
+                                name == "AvgPctMissing_BaseYear" ~ "Base year",
+                                name == "AvgPctMissing_RefYear" ~ "Reference year")
+         ) %>%
+  rename(AvgPctMissing = value) %>%
+  select(Area, TimePeriod, AvgPctMissing)
+
+# Custom chart title
+ChartTitle <- "Average % of missing values across indicators and time"
+
+# Creating the plot
+Chart <- plot_ly(DataForChart,
+                 x = ~AvgPctMissing,
+                 y = ~Area,
+                 text = ~paste(round(AvgPctMissing, 1), "%", sep = " "),
+                 name = ~TimePeriod,
+                 textposition = "outside",
+                 type = "bar",
+                 orientation = "h") %>%
+  layout(title = ChartTitle,
+         yaxis = list(title = ""),
+         xaxis = list(title = "Average percent missing", range = list(0, max(DataForChart$AvgPctMissing) * 1.15)))
+
+# Displaying the plot
+Chart
+```
+
+Specifically, we can see that data is missing a lot more often in the `BaseYear` than in the `ReferenceYear`, with the entirety of the historical data lying in-between. This indicates the improvement of data quality across time.
+
+<br/>
+
+## Differentiating the approach to dealing with missing data
+
+In this and the subsequent section, we work with the following three datasets:
+
+-   `DataForAnalysis`, containing the entirety of the historical data
+
+-   `DataForBaseYear`, containing only data from the base year we've selected to denote the past state of happiness
+
+-   `DataForReferenceYear`, containing only data from the reference year we've selected to denote the current state of happiness
+
+<br/>
+
+## Automatically dropping columns with too many missing values
+
+By definition, we will **entirely remove** columns that contain **more than 10%** missing data. A summary of the number of columns before and after the removal of the problematic variables is printed out below:
+
+```{r rm_cols_too_many_missing, echo = FALSE}
+# Defining a common threshold for missing data
+TresholdMissing <- 10 #pct
+
+# Removing cols with too many missing values in all-time data
+ColsToRemove <- Indicators %>%
+  filter(PctMissing_AllTime > TresholdMissing)
+ColsToRemove_AllTime <- ColsToRemove$Indicator
+
+NCols_All_Before <- length(DataForAnalysis)
+DataForAnalysis <- DataForAnalysis %>%
+  select(-any_of(ColsToRemove_AllTime))
+NCols_All_After <- length(DataForAnalysis)
+
+# Removing cols with too many missing values in data from our base year
+ColsToRemove <- Indicators %>%
+  filter(PctMissing_BaseYear > TresholdMissing)
+ColsToRemove_Base <- ColsToRemove$Indicator
+
+NCols_Base_Before <- length(DataForBaseYear)
+DataForBaseYear <- DataForBaseYear %>%
+  select(-any_of(ColsToRemove_Base))
+NCols_Base_After <- length(DataForBaseYear)
+
+# Removing cols with too many missing values in data from our reference year
+ColsToRemove <- Indicators %>%
+  filter(PctMissing_RefYear > TresholdMissing)
+ColsToRemove_Ref <- ColsToRemove$Indicator
+
+NCols_Ref_Before <- length(DataForReferenceYear)
+DataForReferenceYear <- DataForReferenceYear %>%
+  select(-any_of(ColsToRemove_Ref))
+NCols_Ref_After <- length(DataForReferenceYear)
+
+# Summarizing the consequences of the auto-removal
+Datasets <- c("All time", "Base year", "Reference year")
+NCols_Before <- c(NCols_All_Before, NCols_Base_Before, NCols_Ref_Before)
+NCols_After <- c(NCols_All_After, NCols_Base_After, NCols_Ref_After)
+SummaryData <- data.frame(Datasets, NCols_Before, NCols_After)
+names(SummaryData) <- c("Dataset", "ColumnsBefore", "ColumnsAfter")
+
+SummaryData <- SummaryData %>%
+  mutate(ColumnsDropped = ColumnsBefore - ColumnsAfter,
+         PctDropped = round((ColumnsDropped/ColumnsBefore) * 100, 1)
+         )
+
+# Previewing the generated summary
+SummaryData
+```
+
+<br/>
+
+## Imputing data on a per-country basis
+
+### Method description
+
+The next part in the process is slightly more tricky as we do have many different columns which may have a very different nature. In here, we will be using the `missForest` package to impute for all missing values in all variables. This is not done on a per-country basis as certain countries have no data for some fields, making it impossible to create meaningful imputations. By **doing the imputation at the global level**, we're able to benefit from cross-country pattern recognition and discovering inter-dependencies between variables.
+
+The technique used in here is based on a series of automatically defined and fitted **random forest (RF) models** (each model is cross-validated 5 times). The advantage of using this method is that there are no expectations as to the distribution of the observations and also the fact that we can easily get some summary stats on how accurate the forecasts will likely be.
+
+To further improve the reliability of the imputation, we create what is essentially a series of **10 datasets** with different imputed values. By doing so, we account for the randomness of the missing observations as we can later on combine these datasets into one and run our subsequent analysis on all of them. This will increase the number of observations but in a proportional manner, so the original values will matter in exactly the same way as they did before the imputation was performed. Please note that these duplicates are dealt with further down the line.
+
+<br/>
+
+### Data preparation
+
+To prevent errors from affecting our imputation, we **remove countries which have less than 5 observations** in the all-time historical data (otherwise, the RF models will not be able to produce any results). An overview of the countries we're removing from our analysis is printed below:
+
+```{r rm_countries_too_many_missing, echo = FALSE}
+# Identifying which countries to remove
+CountriesToRemove <- DataForAnalysis %>%
+  group_by(Country, CountryCode) %>%
+  summarize(NumberOfRows = n()) %>%
+  filter(NumberOfRows < 5)
+ListOfCountriesToRemove <- CountriesToRemove$CountryCode
+
+# Printing their codes to the end user
+CountriesToRemove
+```
+
+<br/>
+
+### Data imputation
+
+**Please note** that process of imputing data via RF models may take some time to complete as it can be computationally intensive. Some errors may be generated in some cases as we may have oddly-looking data within some countries/indicators (e.g. not enough predictors/observations to generate RF models).
+
+```{r data_impute_step1, echo = FALSE, warning = FALSE, error = FALSE}
+# Specifying which columns to impute data for
+# (We don't need to impute for happiness data and country metadata)
+ColsToImputeFor <- names(DataForAnalysis)[9:length(names(DataForAnalysis))]
+
+# Removing countries that have too few observation in general terms
+DataForRF <- DataForAnalysis %>%
+  filter(!CountryCode %in% ListOfCountriesToRemove)
+
+# Imputing data for all countries simultaneously
+ImputationResults <- impute_data_for_all(DataForRF, m = 10, maxit = 5, method =  "rf", seed = 736, printFlag = FALSE)
+```
+
+<br/>
+
+### Dealing with the artificially introduced duplicate rows
+
+To get over the artificial increase in number of observations **caused by the random forest imputation** technique, we will group all rows by **year** and **country** and then use the mean value for each of the indicators. If any missing values remain after this step, we will group the rows by year only and then use that average (this second part only concerns less than 70 rows, or less than 3.5% of all rows, and applies to entities not universally recognized as independent countries such as Hong Kong and the Palestinian Authority).
+
+As a final check, we once again see whether we have any missing values after this step of the process:
+
+```{r data_impute_step2, echo=FALSE, warning=FALSE}
+# Getting a list of all columns that need to be re-aggregated
+ColsToReAggregate <- names(ImputationResults)
+ColsToReAggregate <- ColsToReAggregate[9:length(ImputationResults)] 
+
+# Using all other relevant columns as IDs for the aggregation
+ID_Cols <- names(ImputationResults)[3:8]
+
+# Calculating the mean by year and country
+DataForAnalysisImputed <- ImputationResults %>%
+  group_by(across(all_of(ID_Cols))) %>% # try with and without "all_of()"
+  summarise(across(ColsToReAggregate, ~ mean(., na.rm = TRUE))) %>%
+  ungroup() %>%
+  distinct(RowID, .keep_all = TRUE)
+
+# If there are any NANs after this, we use the mean per year
+DataForAnalysisImputed <- DataForAnalysisImputed %>%
+  group_by(Year) %>%
+  mutate(across(ColsToReAggregate, ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+
+# Restoring the original column names
+# (Note: these are transformed by the imputation function)
+names(DataForAnalysisImputed) <- names(DataForAnalysis)
+```
+
+<br/>
+
+### Performing some quality checks after the imputation
+
+Before continuing, we check whether we have **any missing countries** in the dataset containing the imputed observations:
+
+```{r sanity_check1, echo = FALSE}
+# Checking whether we have the same numbers of countries in the two datasets
+if (length(unique(DataForAnalysisImputed$CountryCode)) == length(unique(DataForRF$CountryCode))) {
+  print("No countries were found to be missing in the dataset containing the imputed values.")
+}
+```
+
+Furthermore, we check whether there are any **persisting missing values** even after the imputation (this shouldn't be the case):
+
+```{r sanity_check2, echo = FALSE}
+# Quick check of the total N of missing values
+MissingForCol <- DataForAnalysisImputed %>%
+  summarise_all(function(x) sum(is.na(x)))
+TotalMissing <- sum(is.na(MissingForCol))
+
+# Printing a confirmation
+if (TotalMissing) {
+  print(paste("There are a total of", TotalMissing, "missing values in total.", sep = " "))
+} else {
+  print("There are no missing values in the data frame containing the imputations.")
+}
+```
+
+<br/>
+
+## Final adjustments
+
+As we applied the imputation on the all-time historical data but we now need to split the data so we have separate datasets for the base and the reference years. We need to do this so we can stay true to our **original methodology**, where we completely excluded columns which had more than 10% missing data.
+
+```{r data_export, echo = FALSE}
+# Ungrouping data frame and keeping distinct rows based on country and year
+DataForAnalysisImputed <- DataForAnalysisImputed %>%
+  ungroup() %>%
+  distinct(Country, Year, .keep_all = TRUE)
+
+# Removing cols with too many missing values in the respective year
+# For the base year
+DataForBaseYear <- DataForAnalysisImputed %>%
+  filter(Year == BaseYear) %>%
+  select(!any_of(ColsToRemove_Base))
+
+# For the reference year
+DataForReferenceYear <- DataForAnalysisImputed %>%
+  filter(Year == ReferenceYear) %>%
+  select(!any_of(ColsToRemove_Ref))
+
+# Exporting data
+write_parquet(DataForAnalysis, paste(AnalysisFolder, "Data/Clean/DataForAnalysis.parquet", sep = ""))
+write_parquet(DataForAnalysisImputed, paste(AnalysisFolder, "Data/Clean/DataForAnalysisImputed.parquet", sep = ""))
+write_parquet(DataForBaseYear, paste(AnalysisFolder, "Data/Clean/DataForBaseYear.parquet", sep = ""))
+write_parquet(DataForReferenceYear, paste(AnalysisFolder, "Data/Clean/DataForReferenceYear.parquet", sep = ""))
+```
+
+After these adjustments are applied, we export all three datasets so that the analysis can continue in another notebook. With this, we're finally **ready to start modelling** the data!

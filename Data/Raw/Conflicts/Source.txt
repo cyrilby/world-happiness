@@ -1,0 +1,16 @@
+From: https://ucdp.uu.se/downloads/index.html#onesided
+
+Yearly Datasets covering 1989 - 2021
+UCDP One-sided Violence Dataset version 22.1
+An actor-year dataset with information of intentional attacks on civilians by governments and formally organized armed groups.
+
+Available as:
+
+CSV EXCEL RDATA STATA CODEBOOK
+Version History
+
+Please cite:
+
+• Davies, Shawn, Therese Pettersson & Magnus Öberg (2022). Organized violence 1989-2021 and drone warfare. Journal of Peace Research 59(4).
+
+• Eck, Kristine & Lisa Hultman (2007) Violence Against Civilians in War. Journal of Peace Research 44(2).

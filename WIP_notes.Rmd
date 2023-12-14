@@ -1,0 +1,22 @@
+---
+title: "WIP notes"
+author: "Kiril Boyanov"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## WIP and ideas for improvement as of 11-12-2023
+
+-   The outputs of the models could be saved so that we can create a shiny app or similar where we can present the coefficients and the model metrics side-by-side
+
+-   We can still add some sort of a ML model to see how well we can predict the 2023 happiness score
+
+-   The presentation of the ML output could be by giving the top 10 features or so of the model and providing a range for each of them, then seeing how happy a country might be based on different values for these parameters (the values should range between the min and the max that we have observed in real life)
+
+-   For the variables the model builds upon, we can have simple predictive models for each country and each model feature (input variable) so that we can make predictions for the future
+
+## Ideas for improvement and other notes as of 13-12-2023
+
+-   Once that is complete, I can start work on developing a function that can project the trends in the historical data used as inputs and then generate predictions for `HappinessScore` 2023 and 2024 and then produce a ranking of the countries
+
+    -   It would be best to move the future predictions and application of the model to an entire new notebook so that we don't have to do the grid search every time we want to update the predictions (may require renaming the current notebook).

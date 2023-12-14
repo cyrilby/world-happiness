@@ -1,0 +1,427 @@
+---
+title: 'World happiness study: correlates of happiness at the global level'
+output:
+  html_document:
+    toc: yes
+    toc_depth: 1
+    df_print: paged
+---
+
+<br>
+
+```{r document_details, echo = FALSE}
+cat(" Author: Kiril Boyanov (kirilboyanov [at] gmail.com)\n", "LinkedIn: www.linkedin.com/kirilboyanov/\n", "Last update:", format(Sys.Date(), "%Y-%m-%d"))
+```
+
+<br>
+
+In this file, we explore the correlations between happiness and different economic, political, societal, environmental and health-related factors. We do this both for the most recent year in the data and for all available years in the data. Finally, we explore explore how the correlations have evolved throughout time.
+
+<br>
+
+# Setting things up
+
+Importing relevant packages, defining custom functions, specifying local folders etc.
+
+```{r input_folder,  echo = FALSE}
+# User input: specifying the local path to the folder
+# where the analysis data are to be stored
+AnalysisFolder <- "G:/My Drive/Projects/Data & statistics/Happiness insights/"
+```
+
+```{r library_import, message = FALSE, warning = FALSE}
+# Importing relevant packages
+
+# For general data-related tasks
+library(plyr)
+library(tidyverse)
+library(data.table)
+library(openxlsx)
+library(readxl)
+library(arrow)
+library(zoo)
+
+# For working with countries
+library(countrycode)
+
+# For statistical analysis
+library(corrr)
+
+# For data visualization
+library(ggplot2)
+library(plotly)
+library(rjson)
+```
+
+<br>
+
+# User input
+
+Throughout the analysis, we will be using a common `BaseYear` (to represent the past state of happiness) and a common `ReferenceYear` (to represent the most recent state of happiness). To ensure consistency across files, these two years are stored in a TXT file, which is imported below.
+
+Thus, we use the following years as base and reference:
+
+```{r defining_years, warning = FALSE,  echo = FALSE}
+# Importing the parameters
+YearsToUse <- readLines(paste(AnalysisFolder, "Years to use.txt", sep = ""))
+YearsToUse <- unlist(str_split(YearsToUse, ","))
+BaseYear <- as.numeric(YearsToUse[1])
+ReferenceYear <- as.numeric(YearsToUse[2])
+rm(YearsToUse)
+
+# Printing a confirmation
+cat("Base year: ", BaseYear, "\n")
+cat("Reference year: ", ReferenceYear)
+```
+
+<br>
+
+# Importing data
+
+We import data that was already pre-processed in the `WHR_data_prep.Rmd` notebook and that was subjected to missing data imputation in the `Dealing_with_missing_data.Rmd` notebook. A preview of the data imported is shown below:
+
+<br>
+
+```{r importing_data, echo = FALSE}
+# Importing the data that's ready for use
+DataForAnalysis <- read_parquet(paste(AnalysisFolder, "Data/Clean/DataForAnalysisImputed.parquet", sep = ""))
+
+# Removing GDP in current prices
+DataForAnalysis <- DataForAnalysis %>%
+  select(-E_GDPPerCapitaCurrent)
+
+# Previewing the data
+head(DataForAnalysis, 5)
+```
+
+<br>
+
+Please note that as we have two different measures of GDP included in the data, we're dropping the one that is based on current prices so as not to overestimate the importance of GDP.
+
+<br>
+
+# What correlates with current levels of happiness?
+
+## Most important factors
+
+We start our analysis by exploring how much different factors are correlated to countries' annual happiness scores. We calculate the Pearson correlations for all variables in the data and we sort the factors with the highest absolute correlation on top. A preview of the **top 20 strongest correlations** is shown below:
+
+<br>
+
+```{r top_correlates_ref_year, echo=FALSE, message=FALSE, warning=FALSE}
+# Defining which cols are relevant for the correlations
+ColsToKeep <- names(DataForAnalysis)[9:length(names(DataForAnalysis))]
+
+# Keeping only data for the reference year and removing columns
+# that contain country metadata and time-related variables
+DataForCorr <- DataForAnalysis %>%
+  filter(Year == ReferenceYear) %>%
+  select(HappinessScore, any_of(ColsToKeep))
+
+# Calculating the correlations themselves
+# and sorting by the highest absolute correlation
+Correlations <- DataForCorr %>%
+  correlate(method = "pearson", quiet = TRUE) %>%
+  mutate(across(everything(), ~replace_na(.x, 1))) %>%
+  focus(HappinessScore) %>%
+  filter(term != "CountryRank") %>%
+  rename(Factor = term, Correlation = HappinessScore) %>%
+  mutate(FactorType = case_when(str_sub(Factor, 1, 1) == "E" ~ "Economic",
+                                str_sub(Factor, 1, 1) == "P" ~ "Political",
+                                str_sub(Factor, 1, 1) == "S" ~ "Social",
+                                str_sub(Factor, 1, 1) == "V" ~ "Environmental",
+                                str_sub(Factor, 1, 1) == "H" ~ "Health-related"),
+         AbsCorrelation = round(abs(Correlation), 3),
+         CorrelationType = ifelse(Correlation < 0, "Negative", "Positive"),
+         FactorShort = str_sub(Factor, 1, 30)
+         ) %>%
+  arrange(desc(abs(Correlation))) %>%
+  select(Factor, FactorShort, FactorType, everything())
+
+# Preparing data for chart
+ChartTitle <- paste("The 20 strongest correlates to 'Happiness score'", ReferenceYear, sep = " ")
+DataForChart <- Correlations[1:20,]
+
+# Params for the chart's X-axis
+X_Min <- 0
+X_Max <- 1.2 * max(DataForChart$AbsCorrelation)
+
+# Creating the plot
+Chart <- plot_ly(DataForChart,
+                 x = ~AbsCorrelation,
+                 y = ~reorder(FactorShort, AbsCorrelation),
+                 text = ~AbsCorrelation,
+                 name = ~CorrelationType,
+                 textposition = "outside",
+                 type = "bar",
+                 orientation = "h") %>%
+  layout(title = ChartTitle,
+         yaxis = list(title = ""),
+         xaxis = list(title = "Absolute correlation (0-1)", range = c(X_Min, X_Max))
+         )
+
+# Displaying the plot
+Chart
+```
+
+<br>
+
+The factors with the **strongest correlation** to happiness in 2022 were **health expenditure** and **GDP per capita** as well as government effectiveness and poverty headcount ratio (estimated at 6.85 USD a day). As we can see, several different categories appear on the list of the strongest correlates, with economical and political factors seemingly being the most important. Together, these two categories stand for 70% of the top 20 most strongly correlated factors:
+
+<br>
+
+```{r top_correlates_ref_year_categories, echo=FALSE}
+# Preparing data for chart
+ChartTitle <- paste("Categories which the 20 strongest correlates of happiness belong to", ReferenceYear, sep = " ")
+N_RowsInDf <- nrow(DataForChart)
+
+DataForPieChart <- DataForChart %>%
+  group_by(FactorType) %>%
+  summarise(N_ForFactor = n()) %>%
+  mutate(Pct_ForFactor = round((N_ForFactor/N_RowsInDf) * 100, 2))
+  
+# Creating the plot
+Chart <- plot_ly(DataForPieChart,
+                 values = ~Pct_ForFactor,
+                 labels = ~FactorType,
+                 type = "pie",
+                 textinfo = "label+percent"
+                 ) %>%
+  layout(title = ChartTitle,
+         showlegend = FALSE)
+
+# Displaying the plot
+Chart
+```
+
+<br>
+
+## Least important factors
+
+Conversely, among the least important factors (shown below), we find indicators such as **land area**, proportion of the **population aged 65+**, **military** expenditure as % of GDP and **CO2** emissions:
+
+```{r bottom_correlates_ref_year, echo=FALSE}
+# Preparing data for chart
+ChartTitle <- paste("The 20 weakest correlates to 'Happiness score'", ReferenceYear, sep = " ")
+DataForChart <- Correlations %>%
+  arrange(abs(Correlation))
+DataForChart <- DataForChart[1:20,] %>%
+  arrange(abs(Correlation))
+
+# Params for the chart's X-axis
+X_Min <- 0
+X_Max <- 1.2 * max(DataForChart$AbsCorrelation)
+
+# Creating the plot
+Chart <- plot_ly(DataForChart,
+                 x = ~AbsCorrelation,
+                 y = ~reorder(FactorShort, AbsCorrelation),
+                 text = ~AbsCorrelation,
+                 name = ~CorrelationType,
+                 textposition = "outside",
+                 type = "bar",
+                 orientation = "h") %>%
+  layout(title = ChartTitle,
+         yaxis = list(title = ""),
+         xaxis = list(title = "Absolute correlation (0-1)", range = c(X_Min, X_Max))
+         )
+
+# Displaying the plot
+Chart
+```
+
+<br>
+
+Grouping the most unrelated factors into categories, we see that the picture is a lot more mixed, with social, environmental and health-related factors being more likely to be unrelated to happiness:
+
+<br>
+
+```{r bottom_correlates_ref_year_categories, echo=FALSE}
+# Preparing data for chart
+ChartTitle <- paste("Categories which the 20 weakest correlates of happiness belong to", ReferenceYear, sep = " ")
+N_RowsInDf <- nrow(DataForChart)
+
+DataForPieChart <- DataForChart %>%
+  group_by(FactorType) %>%
+  summarise(N_ForFactor = n()) %>%
+  mutate(Pct_ForFactor = round((N_ForFactor/N_RowsInDf) * 100, 2))
+  
+# Creating the plot
+Chart <- plot_ly(DataForPieChart,
+                 values = ~Pct_ForFactor,
+                 labels = ~FactorType,
+                 type = "pie",
+                 textinfo = "label+percent"
+                 ) %>%
+  layout(title = ChartTitle,
+         showlegend = FALSE)
+
+# Displaying the plot
+Chart
+```
+
+<br>
+
+# How do correlations look like across time?
+
+## Most strongly related factors
+
+### All-time correlations
+
+Looking at the entirety of the data, we can see that it is roughly the same factors that have exhibited the most strong relation to happiness core. Curiously, government effectiveness emerges as the most strongly associated factor across all years:
+
+<br>
+
+```{r top_correlates_all_time, echo=FALSE, message=FALSE}
+# Defining which cols are relevant for the correlations
+ColsToKeep <- names(DataForAnalysis)[9:length(names(DataForAnalysis))]
+
+# Keeping only relevant columns for the calculation of correlations
+DataForCorr <- DataForAnalysis %>%
+  select(HappinessScore, any_of(ColsToKeep))
+
+# Calculating the correlations themselves
+# and sorting by the highest absolute correlation
+Correlations <- DataForCorr %>%
+  correlate(method = "pearson", quiet = TRUE) %>%
+  mutate(across(everything(), ~replace_na(.x, 1))) %>%
+  focus(HappinessScore) %>%
+  filter(term != "CountryRank") %>%
+  rename(Factor = term, Correlation = HappinessScore) %>%
+  mutate(FactorType = case_when(str_sub(Factor, 1, 1) == "E" ~ "Economic",
+                                str_sub(Factor, 1, 1) == "P" ~ "Political",
+                                str_sub(Factor, 1, 1) == "S" ~ "Social",
+                                str_sub(Factor, 1, 1) == "V" ~ "Environmental",
+                                str_sub(Factor, 1, 1) == "H" ~ "Health-related"),
+         AbsCorrelation = round(abs(Correlation), 3),
+         CorrelationType = ifelse(Correlation < 0, "Negative", "Positive"),
+         FactorShort = str_sub(Factor, 1, 30)
+         ) %>%
+  arrange(desc(abs(Correlation))) %>%
+  select(Factor, FactorShort, FactorType, everything())
+
+# Denoting the top 8 most important factors
+Top8MostImportant <- Correlations$Factor[1:8]
+
+# Preparing data for chart
+ChartTitle <- "The 20 strongest correlates to 'Happiness score' (all-time)"
+DataForChart <- Correlations[1:20,]
+
+# Params for the chart's X-axis
+X_Min <- 0
+X_Max <- 1.2 * max(DataForChart$AbsCorrelation)
+
+# Creating the plot
+Chart <- plot_ly(DataForChart,
+                 x = ~AbsCorrelation,
+                 y = ~reorder(FactorShort, AbsCorrelation),
+                 text = ~AbsCorrelation,
+                 name = ~CorrelationType,
+                 textposition = "outside",
+                 type = "bar",
+                 orientation = "h") %>%
+  layout(title = ChartTitle,
+         yaxis = list(title = ""),
+         xaxis = list(title = "Absolute correlation (0-1)", range = c(X_Min, X_Max))
+         )
+
+# Displaying the plot
+Chart
+```
+
+<br>
+
+The distribution between the various **categories** of factors remains similar to the one we saw in our reference year, though historically, economic factors were more likely to be among the strongest correlates than any other kind of factors:
+
+<br>
+
+```{r top_correlates_all_time_categories, echo=FALSE}
+# Preparing data for chart
+ChartTitle <- "Categories which the 20 strongest correlates of happiness belong to (all-time)"
+N_RowsInDf <- nrow(DataForChart)
+
+DataForPieChart <- DataForChart %>%
+  group_by(FactorType) %>%
+  summarise(N_ForFactor = n()) %>%
+  mutate(Pct_ForFactor = round((N_ForFactor/N_RowsInDf) * 100, 2))
+  
+# Creating the plot
+Chart <- plot_ly(DataForPieChart,
+                 values = ~Pct_ForFactor,
+                 labels = ~FactorType,
+                 type = "pie",
+                 textinfo = "label+percent"
+                 ) %>%
+  layout(title = ChartTitle,
+         showlegend = FALSE)
+
+# Displaying the plot
+Chart
+```
+
+<br>
+
+### Annual correlations
+
+To get an understanding of whether the correlations between different factors and happiness evolved or remained rather static across time, we take a look at the top 8 most strongly correlated indicators (based on all-time data) and see how their relationship to happiness has developed:
+
+<br>
+
+```{r annual_correlations, echo=FALSE, message=FALSE, warning=FALSE}
+# Creating a df to store the results
+Corr_AcrossTime <- data.frame()
+
+# Calculating the correlations for each year 
+# and appending them to the df above
+for (year in unique(DataForAnalysis$Year)) {
+# Filtering input data for the correlations
+  TempData <- DataForAnalysis %>%
+      filter(Year == year) %>%
+      select(HappinessScore, any_of(Top8MostImportant))
+  
+  # Calculating the correlations for the year of choice
+  TempCorrelations <- TempData %>%
+    correlate(method = "pearson", quiet = TRUE) %>%
+    mutate(across(everything(), ~replace_na(.x, 1))) %>%
+    select(term, HappinessScore) %>%
+    rename(Factor = term, Correlation = HappinessScore) %>%
+    mutate(AbsCorrelation = abs(Correlation)) %>%
+    filter(Factor != "HappinessScore") %>%
+    mutate(Year = year)
+  
+  # Appending the main dataframe
+  Corr_AcrossTime <- rbind(Corr_AcrossTime, TempCorrelations)
+}
+
+# Shortening the names of the factors for the chart
+Corr_AcrossTime <- Corr_AcrossTime %>%
+  mutate(FactorShort = str_sub(Factor, 1, 30))
+
+# Custom chart title
+ChartTitle <- "Development of average happiness score across country types"
+
+# Creating the plot
+Chart <- plot_ly(Corr_AcrossTime,
+                 x = ~Year,
+                 y = ~AbsCorrelation,
+                 name = ~FactorShort,
+                 textposition = "outside",
+                 type = "scatter",
+                 mode = "lines") %>%
+  layout(title = ChartTitle,
+         xaxis = list(title = "Year"),
+         yaxis = list(title = "Absolute correlation (r)", range = list(0, 1)))
+
+# Displaying the plot
+Chart
+```
+
+<br>
+
+From the chart above, we can draw the **following conclusions**:
+
+-   Although most of the top 8 correlates have remained within the same range, some fluctuation throughout time can be observed;
+
+-   In the period 2005-2007, the changes in correlation strength are most probably due to an improvement in data quality, with more and more countries being available in the data;
+
+-   Generally, the correlations seem to have slightly decrease in their strength; for example, the importance of GDP had a higher correlation in the wake of the Global Financial Crisis of 2008 (*r*=0.83) than in did in 2022 (*r*=0.73).

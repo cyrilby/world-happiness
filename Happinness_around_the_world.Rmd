@@ -1,0 +1,941 @@
+---
+title: 'World happiness study: brief look at happiness around the world'
+output:
+  html_document: 
+    toc: yes
+    df_print: paged
+    toc_depth: 3
+---
+
+<br/>
+
+```{r document_details, echo = FALSE}
+cat(" Author: Kiril Boyanov (kirilboyanov [at] gmail.com)\n", "LinkedIn: www.linkedin.com/kirilboyanov/\n", "Last update:", format(Sys.Date(), "%Y-%m-%d"))
+```
+
+<br/>
+
+In this file, we take a look at the current state of happiness as well as what happiness looked like in the past and how much development has taken place since the base year. We look at both world happiness as well as at happiness by country and region. Finally, we explore whether happiness is rather stable or rather dynamic.
+
+<br/>
+
+# Setting things up
+
+Importing relevant packages, defining custom functions, specifying local folders etc.
+
+```{r input_folder,  echo = FALSE}
+# User input: specifying the local path to the folder
+# where the analysis data are to be stored
+AnalysisFolder <- "G:/My Drive/Projects/Data & statistics/Happiness insights/"
+```
+
+```{r library_import, message = FALSE, warning = FALSE}
+# Importing relevant packages
+
+# For general data-related tasks
+library(plyr)
+library(tidyverse)
+library(data.table)
+library(openxlsx)
+library(readxl)
+library(arrow)
+library(zoo)
+
+# For working with countries
+library(countrycode)
+
+# For data visualization
+library(ggplot2)
+library(plotly)
+library(rjson)
+```
+
+<br/>
+
+# User input
+
+Throughout the analysis, we will be using a common `BaseYear` (to represent the past state of happiness) and a common `ReferenceYear` (to represent the most recent state of happiness). To ensure consistency across files, these two years are stored in a TXT file, which is imported below.
+
+Thus, we use the following years as base and reference:
+
+```{r defining_years, warning = FALSE,  echo = FALSE}
+# Importing the parameters
+YearsToUse <- readLines(paste(AnalysisFolder, "Years to use.txt", sep = ""))
+YearsToUse <- unlist(str_split(YearsToUse, ","))
+BaseYear <- as.numeric(YearsToUse[1])
+ReferenceYear <- as.numeric(YearsToUse[2])
+rm(YearsToUse)
+
+# Printing a confirmation
+cat("Base year: ", BaseYear, "\n")
+cat("Reference year: ", ReferenceYear)
+```
+
+<br/>
+
+# Importing data
+
+We import data that was already pre-processed in the `WHR_data_prep.Rmd` notebook. In here, we only use annual happiness data at the country level, a preview of which is shown below:
+
+```{r importing_data, echo = FALSE}
+# Data on happiness
+Happiness <- read_parquet(paste(AnalysisFolder, "Data/Clean/Happiness.parquet", sep = ""))
+
+# Creating a country ranking for each year and adding continent based on the WB's definition
+Happiness <- Happiness %>%
+  arrange(desc(Year), desc(HappinessScore)) %>%
+  group_by(Year) %>%
+  mutate(CountryRank = row_number()) %>%
+  ungroup() %>%
+  mutate(Continent = countrycode(CountryCode, "iso3c", "continent"),
+         Region = countrycode(CountryCode, "iso3c", "region")
+         )
+
+# Previewing the data
+head(Happiness, 5)
+```
+
+<br/>
+
+# Definitions
+
+## Happiness (subjective well-being)
+
+The authors of the World Happiness Report specify that their measure of happiness is based on the following three measures collected via a survey and then weighted so that a national average can be constructed:
+
+-   **Life evaluations**: respondents are asked to evaluate their current life as a whole using the mental image of a ladder, with the best possible life for them as a 10 and worst possible as a 0. Country rankings are based on 3-year moving averages.
+
+-   **Positive emotions**: an average of three "Yes" or "No" questions about whether the respondents have experienced the following emotions on the previous day: laughter, enjoyment and learning or doing something interesting.
+
+-   **Negative emotions**: an average of three "Yes" or "No" questions about whether the respondents have experienced the following emotions on the previous day: worry, sadness and anger.
+
+For more information on the happiness metrics, please refer to the [report itself](https://worldhappiness.report/ed/2022/).
+
+<br/>
+
+# The current state of happiness
+
+We start out by exploring the current state of happiness as of the chosen `ReferenceYear`:
+
+```{r get_ref_year, echo = FALSE}
+ReferenceYear
+```
+
+<br/>
+
+## Top 10 happiest countries
+
+First, we would like to see what **the happiest countries** are based on their latest annual scores:
+
+```{r happiest_ref_year, echo = FALSE}
+# Specifying how many top and bottom countries to keep
+N_ToKeep <- 10
+
+# Auto-generated chart title
+ChartTitle <- paste("Top", N_ToKeep, "happiest countries in", ReferenceYear)
+
+# Filtering the data
+DataForChart <- Happiness %>%
+  filter(Year == ReferenceYear) %>%
+  mutate(HappinessScore = round(HappinessScore, 2),
+         MaxRank = max(CountryRank),
+         CountryType = ifelse(CountryRank <= N_ToKeep,
+                              paste("Top", N_ToKeep, "happiest"),
+                              paste(N_ToKeep, "least happy"))
+         ) %>%
+  filter(CountryRank <= N_ToKeep) %>% 
+  select(-MaxRank)
+
+# Creating a list of the countries
+Happiest_ReferenceYear <- unique(DataForChart$Country)
+
+# Creating the plot
+Chart <- plot_ly(DataForChart,
+                 x = ~HappinessScore,
+                 y = ~reorder(Country, HappinessScore),
+                 text = ~HappinessScore,
+                 name = ~Continent,
+                 textposition = "outside",
+                 type = "bar",
+                 orientation = "h") %>%
+  layout(title = ChartTitle,
+         yaxis = list(title = ""),
+         xaxis = list(title = "Happiness score", range = list(0, 10)))
+
+# Displaying the plot
+Chart
+```
+
+For those who have followed the news, it's no surprise that the top positions are held by the Nordic countries as well as other fairly well-developed countries. In fact, **8 out of the 10 happiest countries are European**, with the remaining two also having significant European heritage.
+
+<br/>
+
+## The 10 least happy countries
+
+Looking at **the least happy** countries, the findings are not surprising either:
+
+```{r least_happy_ref_year, echo = FALSE}
+# Specifying how many top and bottom countries to keep
+N_ToKeep <- 10
+
+# Auto-generated chart title
+ChartTitle <- paste("The", N_ToKeep, "least happy countries in", ReferenceYear)
+
+# Filtering the data
+DataForChart <- Happiness %>%
+  filter(Year == ReferenceYear) %>%
+  mutate(HappinessScore = round(HappinessScore, 2),
+         MaxRank = max(CountryRank),
+         CountryType = ifelse(CountryRank <= N_ToKeep,
+                              paste("Top", N_ToKeep, "happiest"),
+                              paste(N_ToKeep, "least happy"))
+         ) %>%
+  filter(CountryRank >= MaxRank - N_ToKeep + 1) %>% 
+  select(-MaxRank)
+
+# Creating a list of the countries
+LeastHappy_ReferenceYear <- unique(DataForChart$Country)
+
+# Creating the plot
+Chart <- plot_ly(DataForChart,
+                 x = ~HappinessScore,
+                 y = ~reorder(Country, desc(HappinessScore)),
+                 text = ~HappinessScore,
+                 name = ~Continent,
+                 textposition = "outside",
+                 type = "bar",
+                 orientation = "h") %>%
+  layout(title = ChartTitle,
+         yaxis = list(title = ""),
+         xaxis = list(title = "Happiness score", range = list(0, 10)))
+
+# Displaying the plot
+Chart
+```
+
+Among these less fortunate cases, we found countries that have been in the news because of ongoing military conflicts and countries which we associated with being less well-off. Overall, **8 out of the 10 least happy countries are located in Africa**, with the remaining two countries being located in the Middle East.
+
+<br/>
+
+## Happiness around the world
+
+To be better able to compare happiness across the globe, we will start by using an interactive color-coded **world map** where each country will get its own happiness score plotted with a different color shade. Unfortunately, we do not have data for all countries, so some states will be colored white due to missing observations.
+
+```{r global_happiness_ref_year, echo = FALSE}
+# Keeping only data from the desired year
+DataForChart <- Happiness %>%
+  filter(Year == ReferenceYear)
+
+# Defining type of geolocation data to use
+g <- list(scope = "world", projection = list(type = "orthographic"))
+
+# Creating a plot
+Chart <- plot_ly()
+Chart <- Chart %>% add_trace(
+    type = "choropleth",
+    locations = DataForChart$CountryCode,
+    z = DataForChart$HappinessScore,
+    colorscale = "Blues",
+    reversescale = TRUE,
+    zmin = 0,
+    zmax = 10,
+    marker =list(line = list(width = 0)),
+    hoverinfo = "text",
+    hovertext = paste("Country: ", DataForChart$Country, "<br>Score:", round(DataForChart$HappinessScore, 2), sep = ""))
+
+# Adding legend, title, etc.
+Chart <- Chart %>% colorbar(title = "Happiness score")
+Chart <- Chart %>% layout(title = "Happiness score by country")
+
+Chart <- Chart %>% layout(geo = g)
+
+# Displaying the plot
+Chart
+```
+
+The map above reveals an apparent happiness division between the **Global North** and the **Global South**, though with some exceptions. In the Global South, countries like Brazil, Uruguay, Saudi Arabia, Kazakhstan and Thailand seem to be happier than their neighbors. In the Global North, Ukraine and the Balkans stand out as being less happy than their neighbors.
+
+To better understand how happiness varies around the world, we take a look at some descriptive statistics for the various regions (countries are grouped together based on the World Bank's definition):
+
+```{r regional_happiness_avg, warning = FALSE, echo = FALSE}
+# Keeping only data from the desired year
+FilteredData <- Happiness %>%
+  filter(Year == ReferenceYear)
+
+# Calculating global average
+GlobalAvgScore <- mean(FilteredData$HappinessScore)
+
+# Preparing summary data
+SummaryData <- FilteredData %>%
+  group_by(Region) %>%
+  summarize(NumberOfCountries = n(),
+            Min = min(HappinessScore),
+            Mean = mean(HappinessScore),
+            Max = max(HappinessScore),
+            StDev = sd(HappinessScore)) %>%
+  mutate(StDevPctOfMean = round((StDev/Mean) * 100, 1),
+         AvgHigherThanGlobal = (Mean > GlobalAvgScore)
+         ) %>%
+  filter(!is.na(Region)) %>%
+  arrange(desc(Mean))
+
+# Previewing the data
+# print(GlobalAvgScore)
+SummaryData
+
+```
+
+As expected, more well-off regions such as North America and Europe and Central Asia appear on top of the results with a mean happiness score of 7 and 6.26 respectively. Meanwhile, less well-off regions such as Sub-Saharan Africa and South Asia appear at the bottom, with scores of 4.48 and 4.27 respectively. To put this another way, people living in South Asia are only **39 p.p. less happier** than people living in North America (disregarding the presence of missing values for some countries).
+
+```{r regional_happiness_compared, echo = FALSE}
+# Indexing happiness with the happiest as 100
+IndexedData <- SummaryData %>%
+  mutate(MaxScore = max(Mean),
+         IndexedScore = round((Mean/MaxScore) * 100, 1)
+         )
+
+# Custom title for the chart
+ChartTitle <- "Regions' happiness scored, indexed relative to the happiest region"
+
+# Creating the plot
+Chart <- plot_ly(IndexedData,
+                 x = ~IndexedScore,
+                 y = ~reorder(Region, IndexedScore),
+                 text = ~IndexedScore,
+                 textposition = "outside",
+                 type = "bar",
+                 orientation = "h") %>%
+  layout(title = ChartTitle,
+         yaxis = list(title = ""),
+         xaxis = list(title = "Indexed happiness score (happiest region = 100)", range = list(0, 110)))
+
+# Displaying the plot
+Chart
+```
+
+<br/>
+
+# The past state of happiness
+
+Looking into the past, we explore the state of happiness as of our `BaseYear`:
+
+```{r get_base_year, echo = FALSE}
+BaseYear
+```
+
+<br/>
+
+## Top 10 happiest countries
+
+Looking back in time, we're not surprised to see several Nordic countries like Denmark and Sweden among the top 10 happiest nations. **Curiously though**, the happiest countries in the past also include two countries from the Global South (Venezuela and Saudi Arabia), whose scores have deteriorated significantly in the meantime (more on this later).
+
+```{r happiest_base_year, echo = FALSE}
+# Specifying how many top and bottom countries to keep
+N_ToKeep <- 10
+
+# Auto-generated chart title
+ChartTitle <- paste("Top", N_ToKeep, "happiest countries in", BaseYear)
+
+# Filtering the data
+DataForChart <- Happiness %>%
+  filter(Year == BaseYear) %>%
+  mutate(HappinessScore = round(HappinessScore, 2),
+         MaxRank = max(CountryRank),
+         CountryType = ifelse(CountryRank <= N_ToKeep,
+                              paste("Top", N_ToKeep, "happiest"),
+                              paste(N_ToKeep, "least happy"))
+         ) %>%
+  filter(CountryRank <= N_ToKeep) %>% 
+  select(-MaxRank)
+
+# Creating a list of the countries
+Happiest_BaseYear <- unique(DataForChart$Country)
+
+# Creating the plot
+Chart <- plot_ly(DataForChart,
+                 x = ~HappinessScore,
+                 y = ~reorder(Country, HappinessScore),
+                 text = ~HappinessScore,
+                 name = ~Continent,
+                 textposition = "outside",
+                 type = "bar",
+                 orientation = "h") %>%
+  layout(title = ChartTitle,
+         yaxis = list(title = ""),
+         xaxis = list(title = "Happiness score", range = list(0, 10)))
+
+# Displaying the plot
+Chart
+```
+
+The list of top 10 happiest countries was much more diverse in the past, with only 6 countries on the list being European (compare to 8 in the reference year).
+
+<br/>
+
+## The 10 least happy countries
+
+Looking at **the least happy** countries in the past, the findings reveal the presence of states from both the Global North and the Global South:
+
+```{r least_happy_base_year, echo = FALSE}
+# Specifying how many top and bottom countries to keep
+N_ToKeep <- 10
+
+# Auto-generated chart title
+ChartTitle <- paste("The", N_ToKeep, "least happy countries in", BaseYear)
+
+# Filtering the data
+DataForChart <- Happiness %>%
+  filter(Year == BaseYear) %>%
+  mutate(HappinessScore = round(HappinessScore, 2),
+         MaxRank = max(CountryRank),
+         CountryType = ifelse(CountryRank <= N_ToKeep,
+                              paste("Top", N_ToKeep, "happiest"),
+                              paste(N_ToKeep, "least happy"))
+         ) %>%
+  filter(CountryRank >= MaxRank - N_ToKeep + 1) %>% 
+  select(-MaxRank)
+
+# Creating a list of the countries
+LeastHappy_BaseYear <- unique(DataForChart$Country)
+
+# Creating the plot
+Chart <- plot_ly(DataForChart,
+                 x = ~HappinessScore,
+                 y = ~reorder(Country, desc(HappinessScore)),
+                 text = ~HappinessScore,
+                 name = ~Continent,
+                 textposition = "outside",
+                 type = "bar",
+                 orientation = "h") %>%
+  layout(title = ChartTitle,
+         yaxis = list(title = ""),
+         xaxis = list(title = "Happiness score", range = list(0, 10)))#,
+         #legend = list(x = 100, y = 100, orientation = "h"))
+
+# Displaying the plot
+Chart
+```
+
+Unlike the case in our reference year, where we have no European countries on the list of the least happy ones, in the past, as many as 4 out of 10 entries were held by nations from The Old Continent.
+
+<br/>
+
+# The evolution of happiness over time
+
+The charts above beg questions such as:
+
+-   **What happened to the happiest/least happy countries in the past?** Did they stay close to their original scores or did they undergo dramatic changes?
+
+-   **What kind of developments did we observe for different countries and regions?** Were less happy countries/regions able to climb the ladder of happiness or did they descend further down? Where did happiness increase/decrease?
+
+-   **How stable was the state of happiness throughout time?** Do we see mostly the same countries among the best and the worst performers? How does this look at the regional level?
+
+Below, we'll explore the data to try and find some answers to these questions.
+
+<br/>
+
+## What happened to the formerly happiest countries?
+
+To answer this question, we can take a look at the development of their happiness score throughout time, which presents us with **three conclusions**:
+
+1.  Most of the happiest countries in the base year retained relatively similar scores throughout time.
+2.  However, we can see a slight decline among these nations which applies specifically to European countries.
+3.  The only country to experience a major drop in happiness is Venezuela, where the economic and political circumstances have taken a turn for the worse.
+
+```{r happiest_dev_over_time, echo = FALSE}
+# Filtering the data
+DataForChart <- Happiness %>%
+  filter(Country %in% Happiest_BaseYear) %>%
+  mutate(HappinessScore = round(HappinessScore, 2))
+
+# Custom chart title
+ChartTitle <- paste("Evolution of happiness among the 10 happiest countries in", BaseYear)
+
+# Creating the plot
+Chart <- plot_ly(DataForChart,
+                 x = ~Year,
+                 y = ~HappinessScore,
+                 name = ~Country,
+                 textposition = "outside",
+                 type = "scatter",
+                 mode = "lines") %>%
+  layout(title = ChartTitle,
+         xaxis = list(title = "Year"),
+         yaxis = list(title = "Happiness score", range = list(0, 10)))
+
+# Displaying the plot
+Chart
+```
+
+<br/>
+
+## What happened to the formerly least happy countries?
+
+Looking at how the situation unfolded among the least happy countries in our base year, we arrive at a set of **similar conclusions**:
+
+1.  Most of the least happy countries in the base year retained relatively similar scores throughout time, though the changes in here were more noticeable than in the case of the happiest countries.
+2.  Some of the formerly least happy countries experienced a significant improvement in their score across time (Romania and Hungary, which are both located in Europe).
+3.  Others experienced a significant decline in their score across time (Lebanon, Jordan and Egypt, which are all located in the Middle East).
+
+```{r least_happy_dev_over_time, echo = FALSE}
+# Filtering the data
+DataForChart <- Happiness %>%
+  filter(Country %in% LeastHappy_BaseYear) %>%
+  mutate(HappinessScore = round(HappinessScore, 2))
+
+# Custom chart title
+ChartTitle <- paste("Evolution of happiness among the 10 least happy countries in", BaseYear)
+
+# Creating the plot
+Chart <- plot_ly(DataForChart,
+                 x = ~Year,
+                 y = ~HappinessScore,
+                 name = ~Country,
+                 textposition = "outside",
+                 type = "scatter",
+                 mode = "lines") %>%
+  layout(title = ChartTitle,
+         xaxis = list(title = "Year"),
+         yaxis = list(title = "Happiness score", range = list(0, 10)))
+
+# Displaying the plot
+Chart
+```
+
+<br/>
+
+## How did happiness evolve around the world?
+
+### Regional developments
+
+To answer this question, we take a look at how the happiness score changed across the world:
+
+```{r regional_happiness_over_time, echo = FALSE}
+# Preparing summary data for the whole world
+GlobalScores <- Happiness %>%
+  group_by(Year) %>%
+  summarize(Min = min(HappinessScore),
+            Mean = mean(HappinessScore),
+            Max = max(HappinessScore),
+            StDev = sd(HappinessScore)) %>%
+  mutate(StDevPctOfMean = round((StDev/Mean) * 100, 1),
+         Region = "World"
+         ) %>%
+  filter(!is.na(Region)) %>%
+  arrange(Year, desc(Mean))
+
+# Preparing summary data for the regions
+SummaryData <- Happiness %>%
+  group_by(Region, Year) %>%
+  summarize(Min = min(HappinessScore),
+            Mean = mean(HappinessScore),
+            Max = max(HappinessScore),
+            StDev = sd(HappinessScore),
+            .groups = "keep") %>%
+  mutate(StDevPctOfMean = round((StDev/Mean) * 100, 1)) %>%
+  filter(!is.na(Region))
+
+# Putting the data together
+# Note: data needs to be ungrouped for plotly charts to work
+SummaryData <- rbind(SummaryData, GlobalScores) %>%
+  arrange(Year, Region) %>%
+  ungroup() %>%
+  select(Region, Year, Min, Mean, Max, StDev, StDevPctOfMean) %>%
+  distinct(.keep_all = TRUE)
+
+# Custom chart title
+ChartTitle <- "Evolution of average happiness scores across regions and time"
+
+# Creating the plot
+Chart <- plot_ly(SummaryData,
+                 x = ~Year,
+                 y = ~Mean,
+                 name = ~Region,
+                 textposition = "outside",
+                 type = "scatter",
+                 mode = "lines") %>%
+  layout(title = ChartTitle,
+         xaxis = list(title = "Year"),
+         yaxis = list(title = "Happiness score", range = list(0, 10)))
+
+# Displaying the plot
+Chart
+```
+
+**Unfortunately, global happiness has decreased by 13.8% in the period 2005-2022**. The largest decline is observed in South Asia (-18.4%), while the smallest decline is seen in Europe and Central Asia (-4%). The only region that experienced an increase in happiness was Sub-Saharan Africa (+10%), however, that region still remains at the bottom of the list.
+
+```{r regional_happiness_change, echo = FALSE}
+# Pivoting the data for the base & reference years
+PivotedSummary <- SummaryData %>%
+  filter(Year %in% c(BaseYear, BaseYear +1, ReferenceYear)) %>%
+  select(Region, Year, Mean) %>%
+  mutate() %>%
+  pivot_wider(id_cols = c(Region), names_from = Year, values_from = Mean)
+
+# Calculating change %
+# We use BaseYear+1 if data for BaseYear is NAN
+PivotedSummary <- PivotedSummary %>%
+  mutate(ChangePct = ifelse(is.na(.[[2]]),
+                            (.[[4]] - .[[3]])/.[[3]],
+                            (.[[4]] - .[[2]])/.[[2]]),
+         ChangePct = round(ChangePct * 100, 1)
+         )
+
+# Previwing the data
+PivotedSummary
+```
+
+With these numbers, we can reasonably conclude that **the world is not automatically becoming a happier place** with time and that we may need to put an active effort if we want the planet to be populated by happier people.
+
+*Note: due to missing data for Sub-Saharan Africa for 2005, we use 2006 as the base year for that particular region.*
+
+<br/>
+
+### Country-level developments: winners and losers
+
+It is also relevant to take a look at the countries that experienced the **biggest gains and drops in happiness** from the earliest year they have data on until the reference year of our analysis (we refer to them as the winners and losers). The chart below shows the top 10 biggest winners and losers in terms of happiness change across time:
+
+```{r winning_and_losing_countries, echo = FALSE}
+# Aggregating data and calculating difference between
+# the score in a specific year and the score in the base year
+# (base year can vary by country depending on data availability)
+SummaryData <- Happiness %>%
+  group_by(CountryCode) %>%
+  mutate(BaseYear = min(Year)) %>%
+  ungroup() %>%
+  mutate(BaseScore = ifelse(Year == BaseYear,
+                            HappinessScore,
+                            NA)) %>%
+  group_by(CountryCode) %>%
+  mutate(BaseScore = mean(BaseScore, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(ScoreDiff = HappinessScore - BaseScore,
+         ScoreDiffPct = round((ScoreDiff/BaseScore) * 100, 1),
+         CountryType = ifelse(ScoreDiff > 0, "Winner", "Loser")
+         ) %>%
+  select(Country, CountryCode, CountryType, Year, HappinessScore, ScoreDiff, ScoreDiffPct)
+
+# Keeping data for the year of choice only
+# and only keeping the top 10 winners & losers
+DataForChart <- SummaryData %>%
+  filter(Year == ReferenceYear) %>%
+  arrange(desc(ScoreDiffPct)) %>%
+  mutate(RowNumberWinners = row_number()) %>%
+  arrange(ScoreDiffPct) %>%
+  mutate(RowNumberLosers = row_number()) %>%
+  filter((RowNumberWinners <= 10) | (RowNumberLosers <= 10))
+
+# Custom chart title
+ChartTitle <- "Top 10 winners & losers in terms of happiness change"
+
+# Creating the plot
+Chart <- plot_ly(DataForChart,
+                 x = ~ScoreDiffPct,
+                 y = ~reorder(Country, ScoreDiffPct),
+                 text = ~ScoreDiffPct,
+                 name = ~CountryType,
+                 textposition = "outside",
+                 type = "bar",
+                 orientation = "h") %>%
+  layout(title = ChartTitle,
+         yaxis = list(title = ""),
+         xaxis = list(title = "Change in happiness score (%), reference year compared to base year", range = list(min(DataForChart$ScoreDiffPct) * 1.3, max(DataForChart$ScoreDiffPct) * 1.3)))
+
+# Displaying the plot
+Chart
+
+```
+
+Looking at the chart above, we can see that the countries where happiness increased the most were **Bulgaria, Benin and Liberia** (a jump of 38.4-39.7%), while the countries where happiness decreased the most were **Lebanon, Afghanistan and Jordan** (a drop of 34-46.2%). In all of these cases, the country-level change is a lot larger than the global change, which is a decline in happiness of 13.8%.
+
+<br/>
+
+## How stable was the state of happiness throughout time?
+
+While the development between two specific points in time could be a good indicator of long-term progress, the happiness scores in any particular year could be affected by temporary recent events such as e.g. an economic slowdown, a natural disaster etc. Therefore, it makes sense to take a look at how stable the happiness scores were across time, both at the country and at the regional level.
+
+<br/>
+
+### The countries with the most stable scores
+
+One way of evaluating how stable happiness scores were is to look at the standard deviation of the score relative to its mean value. Another way would be to look at how far the minimum and maximum scores are from the average score. **The top 10 most stable countries have annual scores that all fall in the range of 1.8-5.5% from the average score**; indeed, the box plot and the line charts below show how little the happiness scores have evolved in these ten countries:
+
+```{r most_stable_countries, echo = FALSE}
+# Calculating avg and st dev for happiness scores across time
+SummaryData <- Happiness %>%
+  group_by(Country) %>%
+  summarise(AvgScore = mean(HappinessScore),
+            StDevScore = sd(HappinessScore),
+            StDevRelToAvgPct = round((StDevScore/AvgScore) * 100, 2),
+            MinScore = min(HappinessScore),
+            MaxScore = max(HappinessScore),
+            MinScoreDiff = abs(MinScore - AvgScore),
+            MaxScoreDiff = abs(MaxScore - AvgScore),
+            MinScoreDiffPct = round((MinScoreDiff/AvgScore) * 100, 2),
+            MaxScoreDiffPct = round((MaxScoreDiff/AvgScore) * 100, 2)
+            ) %>%
+  select(-MinScoreDiff, -MaxScoreDiff) %>%
+  arrange(StDevScore)
+
+# Denoting the top 10 most stable countries
+MostStableCountries <- SummaryData$Country[1:10]
+
+# Custom chart title
+ChartTitle <- "Distribution of happiness scores, 10 countries with most stable scores"
+
+# Preparing data for chart
+DataForChart <- Happiness %>%
+  filter(Country %in% MostStableCountries)
+
+# Making the chart
+Chart <- plot_ly(DataForChart,
+                 x = ~HappinessScore,
+                 name = ~Country,
+                 type = "box",
+                 showlegend = FALSE,
+                 orientation = "h") %>%
+  layout(title = ChartTitle,
+         yaxis = list(title = ""),
+         xaxis = list(title = "Happiness score"))
+
+# Displaying the chart
+Chart
+```
+
+While the majority of the countries that have a relatively stable score across time are of Western descent or otherwise well-developed (Hong Kong), we also have Sudan in here as the only country with a relatively *stable but low* happiness score.
+
+<br/>
+
+### The countries with the least stable scores
+
+Moving on to the 10 countries with the least stable happiness scores, we are immediately struck by the fact that their annual scores can be anywhere between **20.4-52.2% off from their average score** in the period, a variation much greater than the one we saw in the most stable countries. Looking at the states included in here, we notice the presence of countries that have experienced significant economic turmoil and/or military conflicts such as Afghanistan, Lebanon, Syria and Venezuela, with the latter being the only one on the list has had a relatively high happiness score at some point in time.
+
+```{r least_stable_countries, echo = FALSE}
+# Sorting the data with the least stable countries on top
+SummaryData <- SummaryData %>%
+  arrange(desc(StDevScore))
+
+# Denoting the top 10 most stable countries
+MostUnstableCountries <- SummaryData$Country[1:10]
+
+# Custom chart title
+ChartTitle <- "Distribution of happiness scores, 10 countries with least stable scores"
+
+# Preparing data for chart
+DataForChart <- Happiness %>%
+  filter(Country %in% MostUnstableCountries)
+
+# Making the chart
+Chart <- plot_ly(DataForChart,
+                 x = ~HappinessScore,
+                 name = ~Country,
+                 type = "box",
+                 showlegend = FALSE,
+                 orientation = "h") %>%
+  layout(title = ChartTitle,
+         yaxis = list(title = ""),
+         xaxis = list(title = "Happiness score"))
+
+# Displaying the chart
+Chart
+```
+
+<br/>
+
+### Most and least stable scoring countries relative to the global average
+
+To make the comparison even more striking, we can take a look at how the 10 most & least stable countries developed across time both **compared to each other and compared to the global average**. To make interpretation easier, all scores are indexed based on the earliest available score for each country, which is assigned the value of 100:
+
+```{r countries_compared_global, echo = FALSE}
+# Preparing summary data for the most stable countries
+Base_MostStable <- Happiness %>%
+  filter(Country %in% MostStableCountries) %>%
+  group_by(CountryCode) %>%
+  mutate(BaseYear = min(Year)) %>%
+  ungroup() %>%
+  filter(Year == BaseYear) %>%
+  rename(BaseScore = HappinessScore) %>%
+  select(CountryCode, BaseYear, BaseScore)
+
+Summary_MostStable <- Happiness %>%
+  filter(Country %in% MostStableCountries) %>%
+  left_join(Base_MostStable, by = "CountryCode") %>%
+  mutate(IndexedScore = (HappinessScore/BaseScore) * 100) %>%
+  group_by(Year) %>%
+  summarize(AvgIndexedScore = mean(IndexedScore)) %>%
+  mutate(AggregateType = "Most stable countries")
+
+# Preparing summary data for the least stable countries
+Base_MostUnstable <- Happiness %>%
+  filter(Country %in% MostUnstableCountries) %>%
+  group_by(CountryCode) %>%
+  mutate(BaseYear = min(Year)) %>%
+  ungroup() %>%
+  filter(Year == BaseYear) %>%
+  rename(BaseScore = HappinessScore) %>%
+  select(CountryCode, BaseYear, BaseScore)
+
+Summary_MostUnstable <- Happiness %>%
+  filter(Country %in% MostUnstableCountries) %>%
+  left_join(Base_MostUnstable, by = "CountryCode") %>%
+  mutate(IndexedScore = (HappinessScore/BaseScore) * 100) %>%
+  group_by(Year) %>%
+  summarize(AvgIndexedScore = mean(IndexedScore)) %>%
+  mutate(AggregateType = "Least stable countries")
+
+# Preparing summary data for the global average
+Base_GlobalAvg <- Happiness %>%
+  filter(Year == min(Happiness$Year)) %>%
+  group_by(Year) %>%
+  summarize(BaseScore = mean(HappinessScore))
+
+Summary_GlobalAvg <- Happiness %>%
+  mutate(BaseScore = mean(Base_GlobalAvg$BaseScore),
+         IndexedScore = (HappinessScore/BaseScore) * 100) %>%
+  group_by(Year) %>%
+  summarize(AvgIndexedScore = mean(IndexedScore)) %>%
+  mutate(AggregateType = "Global average")
+
+# Putting all aggregate data in a single df
+DataForChart <- rbind(Summary_GlobalAvg, Summary_MostStable, Summary_MostUnstable)
+
+# Custom chart title
+ChartTitle <- "Development of average happiness score across country types"
+
+# Creating the plot
+Chart <- plot_ly(DataForChart,
+                 x = ~Year,
+                 y = ~AvgIndexedScore,
+                 name = ~AggregateType,
+                 textposition = "outside",
+                 type = "scatter",
+                 mode = "lines") %>%
+  layout(title = ChartTitle,
+         xaxis = list(title = "Year"),
+         yaxis = list(title = "Average indexed happiness score", range = list(0, 110)))
+
+# Displaying the plot
+Chart
+```
+
+From the chart, we can see that global happiness suffered a decline in 2006, after which point it started on a path of recovery, though it never reached its 2005 level. The 10 most stable countries also experienced a downturn but a much lower one and remained at almost their original levels. Meanwhile, the 10 least stable countries experienced a series of ups and downs and the overall trend of their development remains unclear.
+
+<br/>
+
+### What about all the other countries?
+
+To be able to explore how stable happiness was by country level, we create an interactive world map where we plot the standard deviation relative to the mean (measured in %) for each individual country. Beware that **higher values represent higher instability** of happiness over time:
+
+```{r happiness_instability, warning = FALSE, echo = FALSE}
+# Aggregating the data at the country level
+DataForChart <- Happiness %>%
+  group_by(CountryCode, Country) %>%
+  summarize(AvgScore = mean(HappinessScore),
+            StDev = sd(HappinessScore)) %>%
+  mutate(StDevRelToAvg = round((StDev/AvgScore) * 100))
+
+
+# Defining type of geolocation data to use
+g <- list(scope = "world", projection = list(type = "orthographic"))
+
+# Creating a plot
+Chart <- plot_ly()
+Chart <- Chart %>% add_trace(
+    type = "choropleth",
+    locations = DataForChart$CountryCode,
+    z = DataForChart$StDevRelToAvg,
+    colorscale = "Reds",
+    reversescale = FALSE,
+    zmin = 0,
+    zmax = 10,
+    marker =list(line = list(width = 0)),
+    hoverinfo = "text",
+    hovertext = paste("Country: ", DataForChart$Country, "<br>St dev rel. to mean:", round(DataForChart$StDevRelToAvg, 1), "%", sep = ""))
+
+# Adding legend, title, etc.
+Chart <- Chart %>% colorbar(title = "Instability")
+Chart <- Chart %>% layout(title = "Happiness instability over time by country")
+
+Chart <- Chart %>% layout(geo = g)
+
+# Displaying the plot
+Chart
+```
+
+From this world map, we gather that **happiness is more stable in well-developed countries** in the Global North (though perhaps less so in former members of the East Bloc in Europe). Less stability is seen in the Global South in general, though with some exceptions like South-East Asia (but not India) and South America (but not Venezuela). Still, considerable variation remains even between countries belonging to roughly the same geographical region.
+
+<br/>
+
+### Developments at the regional level
+
+Finally, we take a look at what the distribution of the average happiness score looked in the various regions of the world. In here, we're not as interested in exploring trends or development over time but rather **the stability of the scores** (how far individual values are from the average), so we make another box plot:
+
+```{r regional_happiness_variation, echo = FALSE}
+# Preparing summary data for the whole world
+GlobalScores <- Happiness %>%
+  group_by(Year) %>%
+  summarize(Min = min(HappinessScore),
+            Mean = mean(HappinessScore),
+            Max = max(HappinessScore),
+            StDev = sd(HappinessScore)) %>%
+  mutate(StDevPctOfMean = round((StDev/Mean) * 100, 1),
+         Region = "World"
+         ) %>%
+  filter(!is.na(Region)) %>%
+  arrange(Year, desc(Mean))
+
+# Preparing summary data for the regions
+SummaryData <- Happiness %>%
+  group_by(Region, Year) %>%
+  summarize(Min = min(HappinessScore),
+            Mean = mean(HappinessScore),
+            Max = max(HappinessScore),
+            StDev = sd(HappinessScore),
+            .groups = "keep") %>%
+  mutate(StDevPctOfMean = round((StDev/Mean) * 100, 1)) %>%
+  filter(!is.na(Region))
+
+# Putting the data together
+# Note: data needs to be ungrouped for plotly charts to work
+SummaryData <- rbind(SummaryData, GlobalScores) %>%
+  arrange(Year, Region) %>%
+  ungroup() %>%
+  select(Region, Year, Min, Mean, Max, StDev, StDevPctOfMean) %>%
+  distinct(.keep_all = TRUE)
+
+# Custom chart title
+ChartTitle <- "Distribution of happiness scores: regional & global scores"
+
+# Making the chart
+Chart <- plot_ly(SummaryData,
+                 y = ~Mean,
+                 name = ~Region,
+                 type = "box") %>%
+  layout(title = ChartTitle,
+         xaxis = list(title = "Region"),
+         yaxis = list(title = "Average happiness score"),
+         showlegend = FALSE)
+
+# Displaying the chart
+Chart
+```
+
+In the above chart, we can see that there are regions like East Asia & Pacific where the scores remained relatively stable (except for some outliers) as well as regions that saw a much greater deal of variation like Europe & Central Asia. We can conclude that the although the global happiness trend points downwards, the world moves at different paces, with some countries and regions experiencing relatively stable happiness (or lack thereof) across time and others undergoing much more dynamic changes (for the better or worse).
+
+<br/>
+
+# Conclusion & key take-outs
+
+In this report, we've looked at both the current and the past state of happiness around the world. We've examined both individual countries and regions to see which places are the happiest and to find out how stable happiness is throughout time.
+
+<u>Through our inferential analysis, we've learned that:</u>
+
+-   There has been an **13.8% decline in global happiness** levels in the period 2005-2022
+
+-   The **largest decline in happiness** was observed in countries which have had very dire economic circumstances and/or military conflicts such as Afghanistan, Lebanon and Venezuela, while the **largest improvement** was seen in several African and Eastern European countries
+
+-   **Happiness is not uniformly distributed** around the world, with clear divisions between the Global North and the Global South persisting across time
+
+-   Looking at the 10 countries who were happiest/least happy back in 2005, we see that **most of the happiest ones retained their relative position**, while most of the least happy countries were able to experience a positive change and climb up the happiness ladder in the meantime
+
+-   In terms of **happiness stability**, we saw mostly positive examples, with happier countries and regions having much lower variation in their annual scores, though we also saw some negative examples, with some of the less happy countries and regions also remaining at their lower level as others were able to improve

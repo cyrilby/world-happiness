@@ -1,0 +1,557 @@
+---
+title: "World happiness study: Predicting future happiness"
+author: "Kiril Boyanov"
+date: "`r Sys.Date()`"
+output:
+  html_document: 
+    toc: yes
+    df_print: paged
+    toc_depth: 3
+---
+
+<br>
+
+In this file, we import the already clean data (where we've also made imputations for missing values) containing all individual input variables. Then, we import the parameters of the best performing machine-learning model that we can use to predict future happiness. Before we generate the predictions, we apply a series of country-level regression models that project the historical values on to the next two years, thus providing the inputs we need for applying our machine learning model.
+
+<br>
+
+# Setting things up
+
+Importing relevant packages, defining custom functions, specifying local folders etc.
+
+```{r input_folder, echo = FALSE}
+# User input: specifying the local path to the folder
+# where the analysis data are to be stored
+AnalysisFolder <- "G:/My Drive/Projects/Data & statistics/Happiness insights/"
+```
+
+```{r library_import, message = FALSE, warning = FALSE}
+# Importing relevant packages
+
+# For general data-related tasks
+library(plyr)
+library(tidyverse)
+library(data.table)
+library(openxlsx)
+library(readxl)
+library(arrow)
+library(zoo)
+
+# For statistical analysis and ML
+library(modelr)
+library(randomForest)
+
+# For data visualization
+library(plotly)
+library(ggplot2)
+library(gridExtra)
+```
+
+```{r custom_functions, echo=FALSE}
+# Importing custom functions created for this project
+source("Custom_functions.R")
+```
+
+<br>
+
+# Importing data
+
+Below, we import historical data on happiness and various background variables, where imputations for missing data has already been performed. In addition, we import the parameters we need for fitting the best performing machine learning model (as evidenced by our tests in the `ML_modelling.Rmd` notebook).
+
+```{r data_import, echo=FALSE}
+# Importing historical data including imputations
+DataForAnalysis <- read_parquet(paste(AnalysisFolder, "Data/Clean/DataForAnalysisImputed.parquet", sep = ""))
+
+# Importing the parameters of the best performing model
+ModelParams <- readRDS("Data/Output/ModelParams.Rds")
+```
+
+<br>
+
+# User input
+
+Here, we specify **how many years** into the future to generate predictions for. It should be noted that the farther into the future we go, the less certain the predictions become.
+
+```{r years_for_pred, echo=FALSE}
+# Specifying how many years to generate predictions for
+YearsForPred <- 2
+
+# Printing out a confirmation
+N_Years <- YearsForPred
+YearsForPred <-
+  c((max(DataForAnalysis$Year) + 1):(max(DataForAnalysis$Year) + YearsForPred))
+MinYearForPred <- min(YearsForPred)
+MaxYearForPred <- max(YearsForPred)
+print(
+  sprintf(
+    "Note: predictions will be generated for the years %i-%i.",
+    MinYearForPred,
+    MaxYearForPred
+  )
+)
+```
+
+<br>
+
+We also specify **whether to test all possible models** for the data used as input to our machine learning model or whether to import the results of a previous test.
+
+```{r set_input_test_mode, echo=FALSE}
+# Should we test all input data regression models?
+RefreshAllInputs <- FALSE
+
+# Printing out a confirmation
+if (RefreshAllInputs) {
+  print("Models will be fit and tested for all input variables.")
+  print("Note: this process may take up to 5-10 minutes to complete.")
+} else {
+  print("Results from previously model tests will be imported.")
+  print("Note: this assumes that we're using more or less the same input data.")
+}
+```
+
+<br>
+
+# Preparing inputs for ML model
+
+Before we can proceed to fitting our random forest model, we need to make sure that we have input data in future time periods. Unfortunately, such data is not directly available, however, very good approximations can be obtained by **projecting the trends** found in the historical data to future time periods.
+
+## Defining which variables to use in the ML model
+
+The decision of exactly which variables to include in our predictive model(s) is based on our findings from the `Ridge_regression_analysis.Rmd` notebook, where we explored different combinations of variables.
+
+A **full list of all input variables** fed into the models tested below is presented in here:
+
+<br>
+
+```{r defining_ML_vars, echo=FALSE}
+# Defining Y variable
+Y <- "HappinessScore"
+
+# Importing the list of X variables for use in models as defined
+# in our "Ridge_regression_analysis.Rmd" notebook
+X <- readRDS("Data/Clean/X_Vars.Rds")
+print(X)
+```
+
+<br>
+
+## Generating country-level inputs for ML model
+
+The way we go about projecting historical trends into the future is described below:
+
+1.  We take **each individual variable** for each individual country and **fit** several different regression **models** on it, then record the model fit metrics for each model.
+2.  We select the model with the **lowest** **MAPE** score and use it to generate predictions.
+3.  We loop through all countries and variables used as inputs in the ML model and consolidate the **output** in a single data frame.
+
+<br>
+
+### Looping through model types, countries and variables to find best ways to project the historical trends
+
+Below, we loop through **all countries** in the dataset and **all variables** used as inputs in the machine learning model. We fit the following model types and then record their **RMSE** scores:
+
+-   Linear model where the input variable is modeled as a function of time
+
+-   Quadratic model where the input variable is modeled as a function of time
+
+-   Cubic model where the input variable is modeled as a function of time
+
+-   Autoregressive models where the input variable is modeled as a function of its previous value(s), including anywhere from 1 to 3 annual lags
+
+Please note that this part may be computationally intensive and may **take 5-10 minutes** to complete. The user may in this connection specify not to test all possible models but import the results from a previous test by adjusting the value of the `RefreshAllInputs` variable.
+
+```{r defining_REG_vars, echo=FALSE}
+# Getting unique list of countries and vars needed as inputs for ML
+UniqueCountries <- unique(DataForAnalysis$Country)
+UniqueVariables <- X
+```
+
+```{r autofit_REG_models, echo=FALSE, warning=FALSE}
+# Note: running all models for the input data is conditional on user input
+if (RefreshAllInputs) {
+  # Initializing a data frame to store the results
+ModelTestResults <- data.frame()
+
+# Initializing a progress bar
+pb <- txtProgressBar(min = 1,
+                     max = length(UniqueCountries) * length(UniqueVariables),
+                     style = 3,
+                     width = 50,
+                     char = "=")
+
+# Looping through all countries and indicators and denoting the best fitting models
+i <- 0
+for (country in UniqueCountries) {
+  for (input_var in UniqueVariables) {
+    i <- i + 1
+    setTxtProgressBar(pb, i)
+    TempCountry <- rep(country, 7)
+    TempInputVar <- rep(input_var, 7)
+    TempPlaceholder <-
+      data.frame("Country" = TempCountry, "Variable" = TempInputVar)
+    ModelResults <-
+      AutoFitModels(DataForAnalysis, country, input_var)
+    TempPlaceholder$ModelType <- names(ModelResults)
+    TempPlaceholder$Score_RMSE <- (ModelResults)
+    ModelTestResults <-
+      plyr::rbind.fill(ModelTestResults, TempPlaceholder)
+  }
+}
+
+# Printing a confirmation
+print(sprintf(
+  "\nSuccessfully tested %i country-level models.",
+  nrow(ModelTestResults)
+))
+
+# Marking the best performing model for each country and variable
+# Note: if we have a constant, that will be the best "model"
+ModelBestResults <- as.data.frame(ModelTestResults) %>%
+  mutate(Score_RMSE = unlist(Score_RMSE)) %>%
+  group_by(Country, Variable) %>%
+  mutate(Lowest_RMSE = min(Score_RMSE, na.rm = TRUE),
+         BestPerformer = (Score_RMSE == Lowest_RMSE)) %>%
+  ungroup() %>%
+  filter(BestPerformer)
+
+# Exporting all model results and best model results
+write_csv(ModelTestResults, "Data/Output/BackgroundVars_ModelTestResults.csv")
+write_csv(ModelBestResults, "Data/Output/BackgroundVars_ModelBestResults.csv")
+
+} else {
+  # Importing the best model results for each country and variable
+  ModelBestResults <- read_csv("Data/Output/BackgroundVars_ModelBestResults.csv", show_col_types = FALSE)
+  print(sprintf("Note: imported %i best performing model results from previous run.", nrow(ModelBestResults)))
+}
+```
+
+<br>
+
+### Projecting historical trends into the future
+
+Here, we use the model test results generated/imported in the preceding section to identify and fit the best performing model for each country and variable. Following this, we generate predictions for the period `r MinYearForPred`-`r MaxYearForPred`. Finally, we consolidate the predictions of the background data into a single data frame that can be passed on to our machine learning model.
+
+The user may in this connection specify not to repeat the process upon each re-run of the notebook but to import the **placeholder data** created in a previous run by adjusting the value of the `RefreshAllInputs` variable.
+
+<br>
+
+```{r create_future_placeholder, echo=FALSE}
+# First, we create an empty placeholder for the future
+TempCountries <- rep(UniqueCountries, N_Years)
+TempYears <- sort(rep(YearsForPred, length(UniqueCountries)))
+FuturePlaceholder <-
+  data.frame("Country" = TempCountries, "Year" = TempYears)
+
+# Then, we append the placeholder df to the historical df
+ModelInputData <-
+  plyr::rbind.fill(DataForAnalysis, FuturePlaceholder)
+```
+
+```{r populate_future_placeholder, echo=FALSE}
+# Note: generating new input data from scratch is conditional on user input
+if (RefreshAllInputs) {
+  # Initializing a data frame to store the results
+  InputDataPredictions <- data.frame()
+  
+  # Looping through all countries and indicators
+  for (country in UniqueCountries) {
+    for (input_var in UniqueVariables) {
+      # Getting a string describing the best performing model
+      TempBestModel <- ModelBestResults %>%
+        filter(Country == country & Variable == input_var)
+      TempBestModel <- TempBestModel$ModelType[1]
+      
+      # Fitting the best performer and generating "N_Years" predictions
+      if (TempBestModel == "Constant") {
+        TempPredictions <-
+          ForwardFill(ModelInputData, country, input_var, N_Years)
+      } else if (TempBestModel == "Linear") {
+        TempPredictions <-
+          FitLinear(ModelInputData, country, input_var, "Predictions")
+        TempPredictions <- tail(TempPredictions, N_Years)
+      } else if (TempBestModel == "Quadratic") {
+        TempPredictions <-
+          FitQuadratic(ModelInputData, country, input_var, "Predictions")
+        TempPredictions <- tail(TempPredictions, N_Years)
+      } else if (TempBestModel == "Cubic") {
+        TempPredictions <-
+          FitCubic(ModelInputData, country, input_var, "Predictions")
+        TempPredictions <- tail(TempPredictions, N_Years)
+      } else if (TempBestModel == "AutoReg1Lags") {
+        TempPredictions <-
+          PredictAutoReg(ModelInputData, country, input_var, c(1))
+        TempPredictions <- tail(TempPredictions, N_Years)
+      } else if (TempBestModel == "AutoReg2Lags") {
+        TempPredictions <-
+          PredictAutoReg(ModelInputData, country, input_var, c(1:2))
+        TempPredictions <- tail(TempPredictions, N_Years)
+      } else if (TempBestModel == "AutoReg3Lags") {
+        TempPredictions <-
+          PredictAutoReg(ModelInputData, country, input_var, c(1:3))
+        TempPredictions <- tail(TempPredictions, N_Years)
+      }
+      
+      # Putting the predictions in a data frame
+      TempCountry <- rep(country, N_Years)
+      TempVar <- rep(input_var, N_Years)
+      TempPredictions <-
+        data.frame(
+          "Country" = TempCountry,
+          "Variable" = TempVar,
+          "Year" = YearsForPred,
+          "Value" = TempPredictions
+        )
+      InputDataPredictions <-
+        plyr::rbind.fill(InputDataPredictions, TempPredictions)
+    }
+  }
+  
+  # Pivoting the data frame containing predicted country-level inputs
+  InputDataPredictions <- InputDataPredictions %>%
+    pivot_wider(
+      id_cols = c(Country, Year),
+      names_from = Variable,
+      values_from = Value
+    )
+  
+  # Adding the data back to the input data for the model
+  ModelInputData <- ModelInputData %>%
+    filter(!Year %in% YearsForPred)
+  ModelInputData <-
+    plyr::rbind.fill(ModelInputData, InputDataPredictions)
+  
+  # Making sure ID cols have no missing values
+  ModelInputData <- ModelInputData %>%
+    group_by(Country) %>%
+    fill(CountryCode, Continent, Region, .direction = "down") %>%
+    ungroup() %>%
+    mutate(
+      RowID = paste(Country, Year, sep = "_"),
+      ObservationType = ifelse(Year %in% YearsForPred,
+                               "Prediction",
+                               "Historical data")
+    ) %>%
+    select(ObservationType,
+           Country,
+           CountryCode,
+           RowID,
+           Continent,
+           Region,
+           Year,
+           everything())
+  
+  # Exporting the data and confriming
+  write_parquet(ModelInputData,
+                "Data/Output/PredictiveModelInput.parquet")
+  print("Successfully generated input data for ML model.")
+} else {
+  # Importing input data for ML model from a previous run
+  ModelInputData <-
+    read_parquet("Data/Output/PredictiveModelInput.parquet")
+  print("Successfully imported input data for ML model from a previous run.")
+}
+```
+
+<br>
+
+Now that we have all inputs available for our ML model, we can proceed by fitting it on the training data and then using it to generate predictions for future time periods.
+
+<br>
+
+# Applying ML model
+
+## Generating predictions
+
+Finally, we import our pre-optimized random forest model and use it to generate predictions for the period `r MinYearForPred`-`r MaxYearForPred`.
+
+```{r RF_model_fit, echo=FALSE}
+# Importing the already trained & optimized model
+Model <- readRDS("Data/Output/RF_ModelOfHappiness.Rds")
+
+# Making this example reproducible
+random_seed <- as.integer(ModelParams["random_seed"])
+set.seed(random_seed)
+
+# Applying the model to generate predictions
+ModelInputData$PredictedHappinessScore <- predict(Model, ModelInputData[, X])
+
+# Replacing missing values in "HappinessScore" with the predictions and
+# re-calculating the annual rankings for each country
+N_Missing <- sum(is.na(ModelInputData$HappinessScore))
+WorldHappinessData <- ModelInputData %>%
+  mutate(HappinessScore = ifelse(
+    is.na(HappinessScore),
+    PredictedHappinessScore,
+    HappinessScore
+  )) %>%
+  arrange(Year, desc(HappinessScore)) %>%
+  group_by(Year) %>%
+  mutate(CountryRank = row_number()) %>%
+  ungroup() %>%
+  select(
+    ObservationType,
+    Country,
+    CountryCode,
+    RowID,
+    Continent,
+    Region,
+    Year,
+    HappinessScore,
+    PredictedHappinessScore,
+    CountryRank,
+    everything()
+  )
+
+# Re-setting the random state
+set.seed(NULL)
+
+# Exporting predictions and confirming
+write_parquet(WorldHappinessData, "Data/Output/WorldHappinessData.parquet")
+write_csv(WorldHappinessData, "Data/Output/WorldHappinessData.csv")
+print(sprintf(
+  "Successfully generated predictions for %i rows of data.",
+  N_Missing
+))
+print("Clean dataset containing history and predictions exported to 'Data/Output'.")
+```
+
+<br>
+
+## Top 10 happiest countries in `r MaxYearForPred`
+
+First, we would like to see what **the happiest countries** are based on their last predicted annual scores:
+
+```{r happiest_max_year, echo = FALSE}
+# Specifying how many top and bottom countries to keep
+N_ToKeep <- 10
+
+# Auto-generated chart title
+ChartTitle <- paste("Top", N_ToKeep, "happiest countries in", MaxYearForPred)
+
+# Filtering the data
+DataForChart <- WorldHappinessData %>%
+  filter(Year == MaxYearForPred) %>%
+  mutate(HappinessScore = round(HappinessScore, 2),
+         MaxRank = max(CountryRank),
+         CountryType = ifelse(CountryRank <= N_ToKeep,
+                              paste("Top", N_ToKeep, "happiest"),
+                              paste(N_ToKeep, "least happy"))
+         ) %>%
+  filter(CountryRank <= N_ToKeep) %>% 
+  select(-MaxRank)
+
+# Creating a list of the countries
+Happiest_ReferenceYear <- unique(DataForChart$Country)
+
+# Creating the plot
+Chart <- plot_ly(DataForChart,
+                 x = ~HappinessScore,
+                 y = ~reorder(Country, HappinessScore),
+                 text = ~HappinessScore,
+                 name = ~Continent,
+                 textposition = "outside",
+                 type = "bar",
+                 orientation = "h") %>%
+  layout(title = ChartTitle,
+         yaxis = list(title = ""),
+         xaxis = list(title = "Happiness score", range = list(0, 10)))
+
+# Displaying the plot
+Chart
+```
+
+<br>
+
+As was the case in historical data, we see a lot of Nordic and European countries among the happiest countries in the world; in fact, among the top 10 happiest in `r MaxYearForPred`, we only see European countries.
+
+<br>
+
+## The 10 least happy countries in `r MaxYearForPred`
+
+Looking at **the least happy** countries, the predicted happiness scores are not surprising either given the historical background:
+
+```{r least_happy_max_year, echo = FALSE}
+# Specifying how many top and bottom countries to keep
+N_ToKeep <- 10
+
+# Auto-generated chart title
+ChartTitle <- paste("The", N_ToKeep, "least happy countries in", MaxYearForPred)
+
+# Filtering the data
+DataForChart <- WorldHappinessData %>%
+  filter(Year == MaxYearForPred) %>%
+  mutate(HappinessScore = round(HappinessScore, 2),
+         MaxRank = max(CountryRank),
+         CountryType = ifelse(CountryRank <= N_ToKeep,
+                              paste("Top", N_ToKeep, "happiest"),
+                              paste(N_ToKeep, "least happy"))
+         ) %>%
+  filter(CountryRank >= MaxRank - N_ToKeep + 1) %>% 
+  select(-MaxRank)
+
+# Creating a list of the countries
+LeastHappy_ReferenceYear <- unique(DataForChart$Country)
+
+# Creating the plot
+Chart <- plot_ly(DataForChart,
+                 x = ~HappinessScore,
+                 y = ~reorder(Country, desc(HappinessScore)),
+                 text = ~HappinessScore,
+                 name = ~Continent,
+                 textposition = "outside",
+                 type = "bar",
+                 orientation = "h") %>%
+  layout(title = ChartTitle,
+         yaxis = list(title = ""),
+         xaxis = list(title = "Happiness score", range = list(0, 10)))
+
+# Displaying the plot
+Chart
+```
+
+<br>
+
+Similarly to what we observed in the historical data, we see that a lot of countries suffering from internal/armed conflicts like Afghanistan, Lebanon and Yemen are expected to retain their relatively low levels of happiness even in `r MaxYearForPred`.
+
+<br>
+
+## Happiness around the world in `r MaxYearForPred`
+
+To be better able to compare happiness across the globe, we create an interactive color-coded **world map** where each country will get its own happiness score plotted with a different color shade. Unfortunately, we do not have data for all countries, so some states will be colored white due to missing observations.
+
+```{r global_happiness_max_year, echo = FALSE}
+# Keeping only data from the desired year
+DataForChart <- WorldHappinessData %>%
+  filter(Year == MaxYearForPred)
+
+# Defining type of geolocation data to use
+g <- list(scope = "world", projection = list(type = "orthographic"))
+
+# Creating a plot
+Chart <- plot_ly()
+Chart <- Chart %>% add_trace(
+    type = "choropleth",
+    locations = DataForChart$CountryCode,
+    z = DataForChart$HappinessScore,
+    colorscale = "Blues",
+    reversescale = TRUE,
+    zmin = 0,
+    zmax = 10,
+    marker =list(line = list(width = 0)),
+    hoverinfo = "text",
+    hovertext = paste("Country: ", DataForChart$Country, "<br>Score:", round(DataForChart$HappinessScore, 2), sep = ""))
+
+# Adding legend, title, etc.
+Chart <- Chart %>% colorbar(title = "Happiness score")
+Chart <- Chart %>% layout(title = sprintf("%i happiness score by country", MaxYearForPred))
+
+Chart <- Chart %>% layout(geo = g)
+
+# Displaying the plot
+Chart
+```
+
+<br>
+
+# Conclusion
+
+In this notebook, we've demonstrated how we can use a predictive ML model to estimate the expected level of happiness in the future. In order to do so, we first needed to generate input data for future time periods that we can feed into the model. This was done at the country level, where trends for individual variables were projected into the next `r N_Years` years using the most appropriate regression model for the individual series. After we had our input data ready, the process of predicting future happiness scores was quite straightforward. Finally, we created some visualizations to help us make sense of the predictions, which turned out quite sensible given the historical context.

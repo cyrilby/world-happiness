@@ -1,0 +1,13 @@
+Metric,ValueForValSet,ValueForTestSet
+MAE,0.13,0.15
+RMSE,0.19,0.23
+MAE_PctOfMean,2.36,2.83
+RMSE_PctOfMean,3.37,4.27
+MAPE,2.73,3.59
+Adj_R2,96.36,90.35
+MeanActual,5.56,5.38
+MeanPredicted,5.55,5.39
+StDevActual,1.1,1.16
+StDevPredicted,1.05,1.06
+N_Obs,141,47
+N_Params,27,27
