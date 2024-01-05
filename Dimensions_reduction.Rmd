@@ -144,7 +144,7 @@ fviz_eig(PCA_EconomicData, addlabels = TRUE)
 
 <br/>
 
-Examining the output, we see a clear break-off point after the fifth factor, from where on the share of variance explained by the additional dimension is marginally low. In fact, if we stick to the **first 5 dimensions**, we will already be accounting for **80% of the variance** in the data. Keeping those dimension only, our economics data would look like this:
+Examining the output, we see a clear break-off point after the fifth factor, from where on the share of variance explained by the additional dimension is marginally low. In fact, if we stick to the **first 5 dimensions**, we will already be accounting for **74% of the variance** in the data. Keeping those dimension only, our economics data would look like this:
 
 ```{r pca_economics_dimensions, echo = FALSE}
 # Defining how many dimensions to keep in the PCA output
