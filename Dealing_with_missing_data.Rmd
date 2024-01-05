@@ -15,7 +15,7 @@ cat(" Author: Kiril Boyanov (kirilboyanov [at] gmail.com)\n", "LinkedIn: www.lin
 
 <br/>
 
-In this file, we explore the correlations between happiness and a series of economic, political, societal, environmental and health-related factors. We perform this investigation both by using the most recent data and by looking at historical data so as to see whether the correlations change across time. Additionally, we explore within-country correlations to see whether the strongly correlated factors are mostly the same or different for each country.
+In this file, we deal with missing data by performing an imputation based on a random forest model. For each missing value, 10 possible values are generated, of which the average is kept and used for further analysis. Some columns containing too many missing values may be dropped entirely and therefore not used for analytical purposes.
 
 <br/>
 
